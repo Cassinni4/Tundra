@@ -95,10 +95,13 @@ struct TundraEditor {
     file_tree: Vec<FileEntry>,
     expanded_folders: std::collections::HashSet<PathBuf>,
     file_icons: HashMap<String, egui::TextureHandle>,
+    config_path: PathBuf,
 }
 
 impl TundraEditor {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let config_path = PathBuf::from("tundra_config.json");
+        
         let mut app = Self {
             state: AppState::default(),
             pending_file_selection: false,
@@ -106,31 +109,42 @@ impl TundraEditor {
             file_tree: Vec::new(),
             expanded_folders: std::collections::HashSet::new(),
             file_icons: HashMap::new(),
+            config_path,
         };
 
         // Load file icons
         app.load_file_icons(cc);
 
-        if let Some(storage) = cc.storage {
-            if let Some(saved_state) = storage.get_string("app_state") {
-                if let Ok(loaded_state) = serde_json::from_str::<AppState>(&saved_state) {
-                    app.state = loaded_state;
-                    println!("Loaded state with {} configured games", app.state.game_configs.len());
+        // Try to load state from JSON file
+        app.load_from_json();
+
+        app
+    }
+
+    fn load_from_json(&mut self) {
+        if let Ok(file_content) = fs::read_to_string(&self.config_path) {
+            match serde_json::from_str::<AppState>(&file_content) {
+                Ok(loaded_state) => {
+                    self.state = loaded_state;
+                    println!("Loaded state from JSON with {} configured games", self.state.game_configs.len());
                     
                     // If we have a selected game with a valid path, scan its assets folder
-                    if let Some(game_type) = &app.state.selected_game {
-                        if let Some(config) = app.state.game_configs.get(game_type) {
-                            if app.validate_executable(game_type, &config.executable_path) {
+                    if let Some(game_type) = &self.state.selected_game {
+                        if let Some(config) = self.state.game_configs.get(game_type) {
+                            if self.validate_executable(game_type, &config.executable_path) {
                                 let path = config.executable_path.clone();
-                                app.scan_assets_folder(&path);
+                                self.scan_assets_folder(&path);
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    println!("Failed to parse config file: {}", e);
+                }
             }
+        } else {
+            println!("No config file found at {}", self.config_path.display());
         }
-
-        app
     }
 
     fn load_file_icons(&mut self, cc: &eframe::CreationContext<'_>) {
@@ -179,11 +193,16 @@ impl TundraEditor {
         None
     }
 
-    fn save_state(&self, storage: &mut dyn eframe::Storage) {
-        if let Ok(serialized) = serde_json::to_string(&self.state) {
-            let serialized_clone = serialized.clone();
-            storage.set_string("app_state", serialized);
-            println!("Saved state: {}", serialized_clone);
+    fn save_state(&self) {
+        // Save to JSON file
+        if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
+            if let Err(e) = fs::write(&self.config_path, serialized) {
+                eprintln!("Failed to save config to JSON file: {}", e);
+            } else {
+                println!("Saved state to {}", self.config_path.display());
+            }
+        } else {
+            eprintln!("Failed to serialize state to JSON");
         }
     }
 
@@ -203,6 +222,9 @@ impl TundraEditor {
                         executable_path: file_path.clone(),
                     };
                     self.state.game_configs.insert(game_type.clone(), config);
+                    
+                    // Save state immediately when a new executable is selected
+                    self.save_state();
                     
                     // Automatically go to editor if valid executable
                     if self.validate_executable(&game_type, &file_path) {
@@ -307,7 +329,7 @@ impl TundraEditor {
                         self.show_file_tree(ui, &entry.children);
                     });
 
-                // Update expanded state based on user interaction - FIXED: use is_open() method
+                // Update expanded state based on user interaction
                 if response.header_response.clicked() {
                     if self.expanded_folders.contains(&entry.path) {
                         self.expanded_folders.remove(&entry.path);
@@ -365,6 +387,9 @@ impl TundraEditor {
                     // Otherwise, prompt for file selection
                     self.state.current_step = AppStep::FileSelection;
                 }
+                
+                // Save state when game is selected
+                self.save_state();
             }
             ui.add_space(10.0);
         }
@@ -454,7 +479,7 @@ impl TundraEditor {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            // FIXED: Clone the file_tree to avoid borrowing issues
+                            // Clone the file_tree to avoid borrowing issues
                             let entries = self.file_tree.clone();
                             self.show_file_tree(ui, &entries);
                         });
@@ -502,6 +527,7 @@ impl TundraEditor {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                 if ui.button("Change Game").clicked() {
                     self.state.current_step = AppStep::GameSelection;
+                    self.save_state();
                 }
             });
         });
@@ -531,7 +557,13 @@ impl eframe::App for TundraEditor {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.save_state(storage);
+        // Save to JSON file
+        self.save_state();
+        
+        // Also save to eframe storage for compatibility
+        if let Ok(serialized) = serde_json::to_string(&self.state) {
+            storage.set_string("app_state", serialized);
+        }
     }
 }
 
@@ -542,13 +574,13 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
-            .with_title("Tundra Engine Game Editor")
+            .with_title("Tundra")
             .with_icon(icon),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Tundra Engine Game Editor",
+        "Tundra",
         options,
         Box::new(|cc| Box::new(TundraEditor::new(cc))),
     )
