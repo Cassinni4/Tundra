@@ -13,7 +13,7 @@ enum GameType {
     DisneyInfinity30,
     Cars2TheVideoGame,
     Cars2Arcade,
-    Cars3DrivenToWin,
+    Cars3DrivenToWinXB1,
 }
 
 impl GameType {
@@ -22,7 +22,7 @@ impl GameType {
             GameType::DisneyInfinity30 => "Disney Infinity 3.0",
             GameType::Cars2TheVideoGame => "Cars 2: The Video Game",
             GameType::Cars2Arcade => "Cars 2 Arcade",
-            GameType::Cars3DrivenToWin => "Cars 3: Driven To Win",
+            GameType::Cars3DrivenToWinXB1 => "Cars 3: Driven To Win (Xbox One)",
         }
     }
 
@@ -31,7 +31,7 @@ impl GameType {
             GameType::DisneyInfinity30 => "DisneyInfinity3.exe",
             GameType::Cars2TheVideoGame => "Game-Cars.exe",
             GameType::Cars2Arcade => "sdaemon.exe",
-            GameType::Cars3DrivenToWin => "Cars3.exe",
+            GameType::Cars3DrivenToWinXB1 => "game.consumer.exe",
         }
     }
 
@@ -40,7 +40,7 @@ impl GameType {
             GameType::DisneyInfinity30,
             GameType::Cars2TheVideoGame,
             GameType::Cars2Arcade,
-            GameType::Cars3DrivenToWin,
+            GameType::Cars3DrivenToWinXB1,
         ]
     }
 
@@ -240,13 +240,20 @@ impl TundraEditor {
                     // If we have a selected game with a valid path, scan its assets folder
                     if let Some(game_type) = &self.state.selected_game {
                         if let Some(config) = self.state.game_configs.get(game_type) {
-                            if self.validate_executable(game_type, &config.executable_path) {
+                            if game_type != &GameType::Cars3DrivenToWinXB1 {
+                                if self.validate_executable(game_type, &config.executable_path) {
+                                    let path = config.executable_path.clone();
+                                    self.scan_assets_folder(&path);
+                                }
+                            } else {
+                                if self.validate_executable(game_type, &config.executable_path) {
                                 let path = config.executable_path.clone();
-                                self.scan_assets_folder(&path);
+                                self.scan_dtw_folder(&path);
                             }
                         }
                     }
                 }
+            }
                 Err(e) => {
                     println!("Failed to parse config file: {}", e);
                 }
@@ -387,6 +394,32 @@ impl TundraEditor {
 
             for entry in dir_entries {
                 let entry_path = entry.path();
+                let file_name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+
+                let ignore = [
+                    "appdata.bin",
+                    "appxmanifest.xml",
+                    "buildstamp.lua",
+                    "Catalog000.bin",
+                    "game.consumer.exe",
+                    "microsoft.xbox.gamechat.dll",
+                    "microsoft.xbox.gamechat.winmd",
+                    "microsoft.xbox.services.dll",
+                    "microsoft.xbox.services.winmd",
+                    "resources.pri",
+                    "subheaps.xml",
+                    "threadmonitor.dll",
+                    "update",
+                    "Update.AlignmentChunk"
+                ];
+
+                if ignore.contains(&file_name) {
+                    continue;
+                }
+
                 let is_directory = entry_path.is_dir();
                 
                 let mut file_entry = FileEntry::new(entry_path.clone(), is_directory);
@@ -438,6 +471,19 @@ impl TundraEditor {
             } else {
                 println!("Assets folder not found: {}", assets_dir.display());
             }
+        } else {
+            println!("Could not get parent directory of executable: {}", executable_path.display());
+        }
+    }
+
+    fn scan_dtw_folder(&mut self, executable_path: &Path) {
+        self.file_tree.clear();
+        self.selected_file = None;
+        self.model_viewer.clear_model();
+
+        // Get the directory containing the executable
+        if let Some(parent_dir) = executable_path.parent() {
+            self.file_tree = self.scan_directory(parent_dir, 0)
         } else {
             println!("Could not get parent directory of executable: {}", executable_path.display());
         }
