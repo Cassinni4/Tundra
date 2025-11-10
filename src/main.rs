@@ -40,6 +40,10 @@ impl GameType {
             GameType::Cars3DrivenToWin,
         ]
     }
+
+    fn supports_zip_browsing(&self) -> bool {
+        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,17 +79,32 @@ impl Default for AppState {
 struct FileEntry {
     path: PathBuf,
     is_directory: bool,
+    is_zip: bool,
     children: Vec<FileEntry>,
+    zip_contents_loaded: bool,
 }
 
 impl FileEntry {
     fn new(path: PathBuf, is_directory: bool) -> Self {
+        let is_zip = path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false);
+
         Self {
             path,
             is_directory,
+            is_zip,
             children: Vec::new(),
+            zip_contents_loaded: false,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ZipEntry {
+    name: String,
+    is_directory: bool,
 }
 
 struct TundraEditor {
@@ -293,6 +312,25 @@ impl TundraEditor {
         entries
     }
 
+    fn read_zip_contents(&self, zip_path: &Path) -> Result<Vec<ZipEntry>, Box<dyn std::error::Error>> {
+        let file = fs::File::open(zip_path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        
+        let mut entries = Vec::new();
+        
+        for i in 0..archive.len() {
+            let file = archive.by_index(i)?;
+            let is_directory = file.name().ends_with('/');
+            
+            entries.push(ZipEntry {
+                name: file.name().to_string(),
+                is_directory,
+            });
+        }
+        
+        Ok(entries)
+    }
+
     fn scan_assets_folder(&mut self, executable_path: &Path) {
         self.file_tree.clear();
         self.selected_file = None;
@@ -314,19 +352,87 @@ impl TundraEditor {
         }
     }
 
-    fn show_file_tree(&mut self, ui: &mut egui::Ui, entries: &[FileEntry]) {
+    fn show_file_tree_ui(&mut self, ui: &mut egui::Ui) {
+        let mut entries_to_process = std::mem::take(&mut self.file_tree);
+        self.show_file_tree_internal(ui, &mut entries_to_process);
+        self.file_tree = entries_to_process;
+    }
+
+    fn show_file_tree_internal(&mut self, ui: &mut egui::Ui, entries: &mut Vec<FileEntry>) {
         for entry in entries {
             let display_name = entry.path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
 
-            if entry.is_directory {
+            if entry.is_directory || entry.is_zip {
+                // Handle ZIP files
+                if entry.is_zip {
+                    let initially_open = self.expanded_folders.contains(&entry.path);
+                    
+                    // Show ZIP icon and name in a horizontal layout for ALL games
+                    ui.horizontal(|ui| {
+                        if let Some(zip_icon) = self.file_icons.get("zip") {
+                            egui::Image::new(zip_icon)
+                                .max_size(egui::Vec2::splat(16.0))
+                                .ui(ui);
+                        }
+                        
+                        // Only show dropdown for Cars 2 games that support ZIP browsing
+                        if let Some(game_type) = &self.state.selected_game {
+                            if game_type.supports_zip_browsing() {
+                                let response = egui::CollapsingHeader::new(&display_name)
+                                    .default_open(initially_open)
+                                    .show(ui, |ui| {
+                                        // Load ZIP contents if not already loaded
+                                        if !entry.zip_contents_loaded {
+                                            match self.read_zip_contents(&entry.path) {
+                                                Ok(zip_entries) => {
+                                                    // Convert zip entries to file entries
+                                                    for zip_entry in zip_entries {
+                                                        let virtual_path = entry.path.join(&zip_entry.name);
+                                                        let mut file_entry = FileEntry::new(virtual_path, zip_entry.is_directory);
+                                                        file_entry.is_zip = false;
+                                                        entry.children.push(file_entry);
+                                                    }
+                                                    entry.zip_contents_loaded = true;
+                                                }
+                                                Err(e) => {
+                                                    ui.colored_label(egui::Color32::RED, 
+                                                        format!("Failed to read ZIP: {}", e));
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Show ZIP contents
+                                        self.show_file_tree_internal(ui, &mut entry.children);
+                                    });
+
+                                if response.header_response.clicked() {
+                                    if self.expanded_folders.contains(&entry.path) {
+                                        self.expanded_folders.remove(&entry.path);
+                                    } else {
+                                        self.expanded_folders.insert(entry.path.clone());
+                                    }
+                                }
+                            } else {
+                                // For non-Cars 2 games, just show the ZIP file as a regular file (non-expandable)
+                                let is_selected = self.selected_file.as_ref() == Some(&entry.path);
+                                if ui.selectable_label(is_selected, &display_name).clicked() {
+                                    self.selected_file = Some(entry.path.clone());
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
+
+                // Regular directory (for all games)
                 let initially_open = self.expanded_folders.contains(&entry.path);
                 let response = egui::CollapsingHeader::new(&display_name)
                     .default_open(initially_open)
                     .show(ui, |ui| {
-                        self.show_file_tree(ui, &entry.children);
+                        self.show_file_tree_internal(ui, &mut entry.children);
                     });
 
                 // Update expanded state based on user interaction
@@ -352,8 +458,28 @@ impl TundraEditor {
                         ui.add_space(18.0);
                     }
                     
-                    if ui.selectable_label(is_selected, &display_name).clicked() {
-                        self.selected_file = Some(entry.path.clone());
+                    // Files inside ZIPs get green text (only for Cars 2 games that support ZIP browsing)
+                    let is_in_zip = if let Some(game_type) = &self.state.selected_game {
+                        game_type.supports_zip_browsing() && entry.path.components().any(|c| {
+                            if let std::path::Component::Normal(name) = c {
+                                if let Some(name_str) = name.to_str() {
+                                    return name_str.to_lowercase().ends_with(".zip");
+                                }
+                            }
+                            false
+                        })
+                    } else {
+                        false
+                    };
+                    
+                    if is_in_zip {
+                        if ui.selectable_label(is_selected, egui::RichText::new(&display_name).color(egui::Color32::GREEN)).clicked() {
+                            self.selected_file = Some(entry.path.clone());
+                        }
+                    } else {
+                        if ui.selectable_label(is_selected, &display_name).clicked() {
+                            self.selected_file = Some(entry.path.clone());
+                        }
                     }
                 });
             }
@@ -479,9 +605,7 @@ impl TundraEditor {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            // Clone the file_tree to avoid borrowing issues
-                            let entries = self.file_tree.clone();
-                            self.show_file_tree(ui, &entries);
+                            self.show_file_tree_ui(ui);
                         });
                 }
             });
