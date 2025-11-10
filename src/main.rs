@@ -502,6 +502,18 @@ impl TundraEditor {
                 }
             }
         }
+        
+        // Fall back to regular zip extraction
+        let file = fs::File::open(zip_path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        let mut file = archive.by_name(entry_name)?;
+        
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        
+        Ok(contents)
+    }
+
     fn scan_assets_folder(&mut self, executable_path: &Path) {
         self.file_tree.clear();
         self.selected_file = None;
