@@ -2,11 +2,13 @@ use eframe::egui;
 use eframe::egui::Widget;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 mod in3;
 use in3::ViewModel;
+use in3::read_zip::DisneyInfinityZipReader;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum GameType {
@@ -45,7 +47,7 @@ impl GameType {
     }
 
     fn supports_zip_browsing(&self) -> bool {
-        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade)
+        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade | GameType::DisneyInfinity30)
     }
 }
 
@@ -259,6 +261,7 @@ impl TundraEditor {
     fn load_file_icons(&mut self, cc: &eframe::CreationContext<'_>) {
         let icon_files = [
             ("bik", "src/art/bik.png"),
+            ("dnax", "src/art/lua.png"),
             ("lua", "src/art/lua.png"),
             ("wem", "src/art/wem.png"),
             ("zip", "src/art/zip.png"),
@@ -403,6 +406,40 @@ impl TundraEditor {
     }
 
     fn read_zip_contents(&self, zip_path: &Path) -> Result<Vec<ZipEntry>, Box<dyn std::error::Error>> {
+        // Check if this is a Disney Infinity 3.0 encrypted zip
+        if let Some(game_type) = &self.state.selected_game {
+            if matches!(game_type, GameType::DisneyInfinity30) {
+                println!("Attempting to read as Disney Infinity zip: {}", zip_path.display());
+                
+                // First check if it's actually a Disney Infinity zip
+                if DisneyInfinityZipReader::is_disney_infinity_zip(zip_path) {
+                    println!("Detected as Disney Infinity encrypted zip");
+                    match DisneyInfinityZipReader::read_zip_contents(zip_path) {
+                        Ok(di_entries) => {
+                            println!("Successfully decrypted {} entries", di_entries.len());
+                            // Convert DisneyInfinityZipEntry to our local ZipEntry
+                            let entries: Vec<ZipEntry> = di_entries
+                                .into_iter()
+                                .map(|di_entry| ZipEntry {
+                                    name: di_entry.name,
+                                    is_directory: di_entry.is_directory,
+                                })
+                                .collect();
+                            return Ok(entries);
+                        }
+                        Err(e) => {
+                            println!("Disney Infinity zip decryption failed: {}", e);
+                            // Fall through to regular zip reading
+                        }
+                    }
+                } else {
+                    println!("Not a Disney Infinity encrypted zip, trying regular zip");
+                }
+            }
+        }
+        
+        // Regular zip reading
+        println!("Reading as regular zip: {}", zip_path.display());
         let file = fs::File::open(zip_path)?;
         let mut archive = zip::ZipArchive::new(file)?;
         
@@ -411,16 +448,27 @@ impl TundraEditor {
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
             let is_directory = file.name().ends_with('/');
-            
+    
             entries.push(ZipEntry {
                 name: file.name().to_string(),
                 is_directory,
             });
         }
         
+        println!("Found {} entries in regular zip", entries.len());
         Ok(entries)
     }
 
+    fn extract_zip_file(&self, zip_path: &Path, entry_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let Some(game_type) = &self.state.selected_game {
+            if matches!(game_type, GameType::DisneyInfinity30) {
+                // Try to find the entry in the DI3 zip
+                let entries = DisneyInfinityZipReader::read_zip_contents(zip_path)?;
+                if let Some(entry) = entries.iter().find(|e| e.name == entry_name) {
+                    return DisneyInfinityZipReader::extract_file(zip_path, entry);
+                }
+            }
+        }
     fn scan_assets_folder(&mut self, executable_path: &Path) {
         self.file_tree.clear();
         self.selected_file = None;
