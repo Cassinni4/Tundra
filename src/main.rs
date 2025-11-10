@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 mod in3;
 use in3::ViewModel;
@@ -137,10 +140,21 @@ struct TundraEditor {
     config_path: PathBuf,
     model_viewer: ViewModel::ModelViewer,
     show_options: bool,
+    scan_progress: Option<ScanProgress>,
+    scan_thread: Option<thread::JoinHandle<Vec<FileEntry>>>,
+    scan_cancel: Arc<Mutex<bool>>,
+}
+
+#[derive(Debug, Clone)]
+struct ScanProgress {
+    current_path: PathBuf,
+    total_files: usize,
+    processed_files: usize,
+    start_time: Instant,
 }
 
 impl TundraEditor {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = PathBuf::from("tundra_config.json");
         
         let mut app = Self {
@@ -153,16 +167,19 @@ impl TundraEditor {
             config_path,
             model_viewer: ViewModel::ModelViewer::new(),
             show_options: false,
+            scan_progress: None,
+            scan_thread: None,
+            scan_cancel: Arc::new(Mutex::new(false)),
         };
 
         // Load file icons
-        app.load_file_icons(cc);
+        app.load_file_icons(_cc);
 
         // Try to load state from JSON file
         app.load_from_json();
 
         // Apply theme
-        app.apply_theme(cc);
+        app.apply_theme(_cc);
 
         app
     }
@@ -249,13 +266,13 @@ impl TundraEditor {
                                 }
                             } else {
                                 if self.validate_executable(game_type, &config.executable_path) {
-                                let path = config.executable_path.clone();
-                                self.scan_dtw_folder(&path);
+                                    let path = config.executable_path.clone();
+                                    self.scan_dtw_folder(&path);
+                                }
                             }
                         }
                     }
                 }
-            }
                 Err(e) => {
                     println!("Failed to parse config file: {}", e);
                 }
@@ -347,7 +364,11 @@ impl TundraEditor {
                     
                     // Automatically go to editor if valid executable
                     if self.validate_executable(&game_type, &file_path) {
-                        self.scan_assets_folder(&file_path);
+                        if game_type != GameType::Cars3DrivenToWinXB1 {
+                            self.scan_assets_folder(&file_path);
+                        } else {
+                            self.scan_dtw_folder(&file_path);
+                        }
                         self.state.current_step = AppStep::Editor;
                         println!("Valid executable selected for {}, opening editor", game_type.as_str());
                     } else {
@@ -376,12 +397,18 @@ impl TundraEditor {
             .map(|config| config.executable_path.clone())
     }
 
-    fn scan_directory(&mut self, path: &Path, depth: usize) -> Vec<FileEntry> {
+    fn scan_directory_threaded(path: PathBuf, cancel_flag: Arc<Mutex<bool>>) -> Vec<FileEntry> {
         let mut entries = Vec::new();
         
-        if let Ok(read_dir) = fs::read_dir(path) {
+        // Check if cancelled before starting
+        if *cancel_flag.lock().unwrap() {
+            return entries;
+        }
+        
+        if let Ok(read_dir) = fs::read_dir(&path) {
             let mut dir_entries: Vec<_> = read_dir.flatten().collect();
-            // Sort entries: directories first, then files, both alphabetically
+            
+            // Sort entries: directories first, then files
             dir_entries.sort_by(|a, b| {
                 let a_is_dir = a.path().is_dir();
                 let b_is_dir = b.path().is_dir();
@@ -396,12 +423,18 @@ impl TundraEditor {
             });
 
             for entry in dir_entries {
+                // Check cancellation flag periodically
+                if *cancel_flag.lock().unwrap() {
+                    break;
+                }
+                
                 let entry_path = entry.path();
                 let file_name = entry_path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or_default();
 
+                // Cars 3 specific ignore list
                 let ignore = [
                     "appdata.bin",
                     "appxmanifest.xml",
@@ -427,8 +460,9 @@ impl TundraEditor {
                 
                 let mut file_entry = FileEntry::new(entry_path.clone(), is_directory);
                 
-                if is_directory && depth < 10 { // Limit recursion depth
-                    file_entry.children = self.scan_directory(&entry_path, depth + 1);
+                // Recursively scan directories (with cancellation check)
+                if is_directory {
+                    file_entry.children = Self::scan_directory_threaded(entry_path, cancel_flag.clone());
                 }
                 
                 entries.push(file_entry);
@@ -515,6 +549,15 @@ impl TundraEditor {
     }
 
     fn scan_assets_folder(&mut self, executable_path: &Path) {
+        // Cancel any ongoing scan
+        *self.scan_cancel.lock().unwrap() = true;
+        if let Some(thread) = self.scan_thread.take() {
+            let _ = thread.join();
+        }
+        
+        // Reset cancel flag
+        *self.scan_cancel.lock().unwrap() = false;
+        
         self.file_tree.clear();
         self.selected_file = None;
         self.model_viewer.clear_model();
@@ -523,13 +566,40 @@ impl TundraEditor {
         if let Some(parent_dir) = executable_path.parent() {
             let assets_dir = parent_dir.join("assets");
             
-            println!("Scanning assets folder: {}", assets_dir.display());
+            println!("Starting threaded scan of: {}", assets_dir.display());
             
             if assets_dir.exists() && assets_dir.is_dir() {
-                self.file_tree = self.scan_directory(&assets_dir, 0);
-                println!("Scanned file tree with {} root entries", self.file_tree.len());
+                let scan_path = assets_dir.clone(); // Clone here to avoid move
+                let cancel_flag = self.scan_cancel.clone();
+                
+                // Start threaded scan
+                self.scan_thread = Some(thread::spawn(move || {
+                    Self::scan_directory_threaded(scan_path, cancel_flag)
+                }));
+                
+                // Show progress immediately
+                self.scan_progress = Some(ScanProgress {
+                    current_path: assets_dir,
+                    total_files: 0, // We don't know the total yet
+                    processed_files: 0,
+                    start_time: Instant::now(),
+                });
             } else {
                 println!("Assets folder not found: {}", assets_dir.display());
+                // Fall back to scanning the parent directory
+                let scan_path = parent_dir.to_path_buf();
+                let cancel_flag = self.scan_cancel.clone();
+                
+                self.scan_thread = Some(thread::spawn(move || {
+                    Self::scan_directory_threaded(scan_path, cancel_flag)
+                }));
+                
+                self.scan_progress = Some(ScanProgress {
+                    current_path: parent_dir.to_path_buf(),
+                    total_files: 0,
+                    processed_files: 0,
+                    start_time: Instant::now(),
+                });
             }
         } else {
             println!("Could not get parent directory of executable: {}", executable_path.display());
@@ -537,16 +607,73 @@ impl TundraEditor {
     }
 
     fn scan_dtw_folder(&mut self, executable_path: &Path) {
+        // Cancel any ongoing scan
+        *self.scan_cancel.lock().unwrap() = true;
+        if let Some(thread) = self.scan_thread.take() {
+            let _ = thread.join();
+        }
+        
+        // Reset cancel flag
+        *self.scan_cancel.lock().unwrap() = false;
+        
         self.file_tree.clear();
         self.selected_file = None;
         self.model_viewer.clear_model();
 
         // Get the directory containing the executable
         if let Some(parent_dir) = executable_path.parent() {
-            self.file_tree = self.scan_directory(parent_dir, 0)
+            println!("Starting threaded scan of: {}", parent_dir.display());
+            
+            let scan_path = parent_dir.to_path_buf();
+            let cancel_flag = self.scan_cancel.clone();
+            
+            self.scan_thread = Some(thread::spawn(move || {
+                Self::scan_directory_threaded(scan_path, cancel_flag)
+            }));
+            
+            self.scan_progress = Some(ScanProgress {
+                current_path: parent_dir.to_path_buf(),
+                total_files: 0,
+                processed_files: 0,
+                start_time: Instant::now(),
+            });
         } else {
             println!("Could not get parent directory of executable: {}", executable_path.display());
         }
+    }
+
+    fn check_scan_completion(&mut self) {
+        if let Some(thread) = &self.scan_thread {
+            if thread.is_finished() {
+                if let Some(thread) = self.scan_thread.take() {
+                    match thread.join() {
+                        Ok(result) => {
+                            self.file_tree = result;
+                            self.scan_progress = None;
+                            println!("Scan completed with {} root entries", self.file_tree.len());
+                            
+                            // Log total file count
+                            let total_files = self.count_files(&self.file_tree);
+                            println!("Total files and directories found: {}", total_files);
+                        }
+                        Err(e) => {
+                            eprintln!("Scan thread panicked: {:?}", e);
+                            self.scan_progress = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn count_files(&self, entries: &[FileEntry]) -> usize {
+        let mut count = entries.len();
+        for entry in entries {
+            if entry.is_directory {
+                count += self.count_files(&entry.children);
+            }
+        }
+        count
     }
 
     fn handle_model_file_selection(&mut self, file_path: &PathBuf) {
@@ -596,6 +723,24 @@ impl TundraEditor {
     }
 
     fn show_file_tree_ui(&mut self, ui: &mut egui::Ui) {
+        // Check if scan is complete
+        self.check_scan_completion();
+
+        // Show progress if scanning
+        if let Some(progress) = &self.scan_progress {
+            ui.heading("Scanning Files...");
+            ui.label(format!("Scanning: {}", progress.current_path.display()));
+            ui.label(format!("Elapsed: {:?}", progress.start_time.elapsed()));
+            ui.add(egui::Spinner::new().size(32.0));
+            ui.label("This may take a while for large directories...");
+            return;
+        }
+
+        if self.file_tree.is_empty() {
+            ui.label("No files found");
+            return;
+        }
+
         let mut entries_to_process = std::mem::take(&mut self.file_tree);
         self.show_file_tree_internal(ui, &mut entries_to_process);
         self.file_tree = entries_to_process;
@@ -767,7 +912,11 @@ impl TundraEditor {
                 if let Some(path) = self.get_game_path(&game_type) {
                     // If we already have a valid path, go directly to editor
                     if self.validate_executable(&game_type, &path) {
-                        self.scan_assets_folder(&path);
+                        if game_type != GameType::Cars3DrivenToWinXB1 {
+                            self.scan_assets_folder(&path);
+                        } else {
+                            self.scan_dtw_folder(&path);
+                        }
                         self.state.current_step = AppStep::Editor;
                     } else {
                         // If path exists but is invalid, go to file selection
@@ -804,7 +953,11 @@ impl TundraEditor {
             if self.validate_executable(&game_type, &config.executable_path) {
                 // If we have a valid executable, automatically switch to editor
                 let path = config.executable_path.clone();
-                self.scan_assets_folder(&path);
+                if game_type != GameType::Cars3DrivenToWinXB1 {
+                    self.scan_assets_folder(&path);
+                } else {
+                    self.scan_dtw_folder(&path);
+                }
                 self.state.current_step = AppStep::Editor;
                 return;
             }
@@ -902,6 +1055,9 @@ impl TundraEditor {
     }
 
     fn show_editor(&mut self, ctx: &egui::Context) {
+        // Check scan completion
+        self.check_scan_completion();
+
         // Use SidePanel for the file list to ensure it takes full height
         egui::SidePanel::left("file_panel")
             .resizable(false)
@@ -914,17 +1070,31 @@ impl TundraEditor {
                     if let Some(config) = self.state.game_configs.get(game_type) {
                         ui.label(format!("Game: {}", game_type.as_str()));
                         if let Some(parent_dir) = config.executable_path.parent() {
-                            let assets_dir = parent_dir.join("assets");
-                            ui.label(format!("Assets: {}", assets_dir.display()));
+                            if game_type != &GameType::Cars3DrivenToWinXB1 {
+                                let assets_dir = parent_dir.join("assets");
+                                ui.label(format!("Assets: {}", assets_dir.display()));
+                            } else {
+                                ui.label(format!("Directory: {}", parent_dir.display()));
+                            }
                         }
                     }
                 }
                 
+                // Show file count if scan is complete
+                if self.scan_progress.is_none() && !self.file_tree.is_empty() {
+                    let total_files = self.count_files(&self.file_tree);
+                    ui.label(format!("Total files: {}", total_files));
+                }
+                
                 ui.separator();
                 
-                if self.file_tree.is_empty() {
-                    ui.label("No files found in assets folder");
-                    ui.label("Make sure there's an 'assets' folder next to the executable");
+                if self.file_tree.is_empty() && self.scan_progress.is_none() {
+                    ui.label("No files found");
+                    if let Some(game_type) = &self.state.selected_game {
+                        if game_type != &GameType::Cars3DrivenToWinXB1 {
+                            ui.label("Make sure there's an 'assets' folder next to the executable");
+                        }
+                    }
                 } else {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
