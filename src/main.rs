@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 
+mod in3;
+use in3::ViewModel;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum GameType {
     DisneyInfinity30,
@@ -56,6 +59,7 @@ struct AppState {
     selected_game: Option<GameType>,
     game_configs: HashMap<GameType, GameConfig>,
     current_step: AppStep,
+    theme: Theme,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,12 +69,26 @@ enum AppStep {
     Editor,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+enum Theme {
+    Dark,
+    Light,
+    System,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::Dark
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
             selected_game: None,
             game_configs: HashMap::new(),
             current_step: AppStep::GameSelection,
+            theme: Theme::Dark,
         }
     }
 }
@@ -115,6 +133,8 @@ struct TundraEditor {
     expanded_folders: std::collections::HashSet<PathBuf>,
     file_icons: HashMap<String, egui::TextureHandle>,
     config_path: PathBuf,
+    model_viewer: ViewModel::ModelViewer,
+    show_options: bool,
 }
 
 impl TundraEditor {
@@ -129,6 +149,8 @@ impl TundraEditor {
             expanded_folders: std::collections::HashSet::new(),
             file_icons: HashMap::new(),
             config_path,
+            model_viewer: ViewModel::ModelViewer::new(),
+            show_options: false,
         };
 
         // Load file icons
@@ -137,7 +159,75 @@ impl TundraEditor {
         // Try to load state from JSON file
         app.load_from_json();
 
+        // Apply theme
+        app.apply_theme(cc);
+
         app
+    }
+
+    fn apply_theme(&self, cc: &eframe::CreationContext<'_>) {
+        match self.state.theme {
+            Theme::Dark => {
+                cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            }   
+            Theme::Light => {
+                cc.egui_ctx.set_visuals(egui::Visuals::light());
+            }
+            Theme::System => {
+                // System theme follows the OS preference
+                #[cfg(target_os = "windows")]
+                {
+                    use winreg::enums::*;
+                    use winreg::RegKey;
+                
+                    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+                    if let Ok(personalize) = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize") {
+                        if let Ok(apps_use_light_theme) = personalize.get_value::<u32, _>("AppsUseLightTheme") {
+                            if apps_use_light_theme == 1 {
+                                cc.egui_ctx.set_visuals(egui::Visuals::light());
+                                return;
+                            }
+                        }
+                    }
+                }
+            
+                #[cfg(target_os = "macos")]
+                {
+                    use std::process::Command;
+                
+                    if let Ok(output) = Command::new("defaults").args(&["read", "-g", "AppleInterfaceStyle"]).output() {
+                        if output.status.success() {
+                            let theme = String::from_utf8_lossy(&output.stdout);
+                            if theme.to_lowercase().contains("dark") {
+                                cc.egui_ctx.set_visuals(egui::Visuals::dark());
+                                return;
+                            }
+                        }
+                    }
+                    cc.egui_ctx.set_visuals(egui::Visuals::light());
+                    return;
+                }
+            
+                #[cfg(target_os = "linux")]
+                {
+                    use std::process::Command;
+                
+                    // Try to detect GTK theme
+                    if let Ok(output) = Command::new("gsettings").args(&["get", "org.gnome.desktop.interface", "gtk-theme"]).output() {
+                        if output.status.success() {
+                            let theme = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                            if theme.contains("dark") {
+                                cc.egui_ctx.set_visuals(egui::Visuals::dark());
+                                return;
+                            }
+                        }
+                    }
+                }
+            
+                // Default fallback to dark theme
+                cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            }
+        }
     }
 
     fn load_from_json(&mut self) {
@@ -168,7 +258,7 @@ impl TundraEditor {
 
     fn load_file_icons(&mut self, cc: &eframe::CreationContext<'_>) {
         let icon_files = [
-            ("bnk", "src/art/bnk.png"),
+            ("bik", "src/art/bik.png"),
             ("lua", "src/art/lua.png"),
             ("wem", "src/art/wem.png"),
             ("zip", "src/art/zip.png"),
@@ -334,6 +424,7 @@ impl TundraEditor {
     fn scan_assets_folder(&mut self, executable_path: &Path) {
         self.file_tree.clear();
         self.selected_file = None;
+        self.model_viewer.clear_model();
 
         // Get the directory containing the executable
         if let Some(parent_dir) = executable_path.parent() {
@@ -349,6 +440,52 @@ impl TundraEditor {
             }
         } else {
             println!("Could not get parent directory of executable: {}", executable_path.display());
+        }
+    }
+
+    fn handle_model_file_selection(&mut self, file_path: &PathBuf) {
+        println!("Model file selected: {}", file_path.display());
+        
+        if let Some(extension) = file_path.extension().and_then(|e| e.to_str()) {
+            if extension.eq_ignore_ascii_case("ibuf") || extension.eq_ignore_ascii_case("vbuf") {
+                // Find the corresponding file
+                let base_name = file_path.with_extension("");
+                let other_extension = if extension.eq_ignore_ascii_case("ibuf") { "vbuf" } else { "ibuf" };
+                let other_file = base_name.with_extension(other_extension);
+                
+                println!("Looking for corresponding file: {}", other_file.display());
+                
+                if other_file.exists() {
+                    let (ibuf_path, vbuf_path) = if extension.eq_ignore_ascii_case("ibuf") {
+                        (file_path.clone(), other_file)
+                    } else {
+                        (other_file, file_path.clone())
+                    };
+                    
+                    println!("Loading model from:\n  IBUF: {}\n  VBUF: {}", 
+                        ibuf_path.display(), vbuf_path.display());
+                    
+                    match self.model_viewer.load_model_from_files(&ibuf_path, &vbuf_path) {
+                        Ok(_) => {
+                            println!("Successfully loaded model from {} and {}", 
+                                ibuf_path.display(), vbuf_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to load model: {}", e);
+                        }
+                    }
+                } else {
+                    println!("Corresponding {} file not found: {}", other_extension, other_file.display());
+                    self.model_viewer.clear_model();
+                }
+            } else {
+                // Not a model file, clear the model
+                println!("Not a model file, clearing model viewer");
+                self.model_viewer.clear_model();
+            }
+        } else {
+            // No extension, clear the model
+            self.model_viewer.clear_model();
         }
     }
 
@@ -420,6 +557,13 @@ impl TundraEditor {
                                 let is_selected = self.selected_file.as_ref() == Some(&entry.path);
                                 if ui.selectable_label(is_selected, &display_name).clicked() {
                                     self.selected_file = Some(entry.path.clone());
+                                    
+                                    // Handle model files for Disney Infinity
+                                    if let Some(game_type) = &self.state.selected_game {
+                                        if matches!(game_type, GameType::DisneyInfinity30) {
+                                            self.handle_model_file_selection(&entry.path);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -475,10 +619,24 @@ impl TundraEditor {
                     if is_in_zip {
                         if ui.selectable_label(is_selected, egui::RichText::new(&display_name).color(egui::Color32::GREEN)).clicked() {
                             self.selected_file = Some(entry.path.clone());
+                            
+                            // Handle model files for Disney Infinity
+                            if let Some(game_type) = &self.state.selected_game {
+                                if matches!(game_type, GameType::DisneyInfinity30) {
+                                    self.handle_model_file_selection(&entry.path);
+                                }
+                            }
                         }
                     } else {
                         if ui.selectable_label(is_selected, &display_name).clicked() {
                             self.selected_file = Some(entry.path.clone());
+                            
+                            // Handle model files for Disney Infinity
+                            if let Some(game_type) = &self.state.selected_game {
+                                if matches!(game_type, GameType::DisneyInfinity30) {
+                                    self.handle_model_file_selection(&entry.path);
+                                }
+                            }
                         }
                     }
                 });
@@ -577,6 +735,66 @@ impl TundraEditor {
         }
     }
 
+    fn run_game(&self) {
+        if let Some(game_type) = &self.state.selected_game {
+            if let Some(config) = self.state.game_configs.get(game_type) {
+                let executable_path = &config.executable_path;
+                
+                println!("Attempting to run game: {}", executable_path.display());
+                
+                match std::process::Command::new(executable_path).spawn() {
+                    Ok(_) => {
+                        println!("Successfully launched game: {}", game_type.as_str());
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to launch game: {}", e);
+                    }
+                }
+            } else {
+                eprintln!("No executable configured for game: {}", game_type.as_str());
+            }
+        } else {
+            eprintln!("No game selected");
+        }
+    }
+
+    fn show_options_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Options");
+        ui.separator();
+        
+        ui.label("Theme:");
+        ui.horizontal(|ui| {
+            let previous_theme = self.state.theme.clone();
+            
+            ui.radio_value(&mut self.state.theme, Theme::Dark, "Dark");
+            ui.radio_value(&mut self.state.theme, Theme::Light, "Light");
+            ui.radio_value(&mut self.state.theme, Theme::System, "System");
+            
+            // Apply theme immediately if changed
+            if self.state.theme != previous_theme {
+                match self.state.theme {
+                    Theme::Dark => {
+                        ctx.set_visuals(egui::Visuals::dark());
+                    }
+                    Theme::Light => {
+                        ctx.set_visuals(egui::Visuals::light());
+                    }
+                    Theme::System => {
+                        // For System theme, we'd need to re-detect the system preference
+                        // For now, we'll just use dark as fallback
+                        ctx.set_visuals(egui::Visuals::dark());
+                    }
+                }
+                self.save_state();
+            }
+        });
+        
+        ui.separator();
+        if ui.button("Close").clicked() {
+            self.show_options = false;
+        }
+    }
+
     fn show_editor(&mut self, ctx: &egui::Context) {
         // Use SidePanel for the file list to ensure it takes full height
         egui::SidePanel::left("file_panel")
@@ -610,48 +828,85 @@ impl TundraEditor {
                 }
             });
 
+        // Show options window if needed
+        if self.show_options {
+            egui::Window::new("Options")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    self.show_options_menu(ui, ctx);
+                });
+        }
+
         // The rest of the space is for the main area
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(selected_path) = &self.selected_file {
-                ui.heading("File Editor");
-                ui.separator();
-                
-                let file_name = selected_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown");
-                
-                // Show file icon in editor header if available
-                ui.horizontal(|ui| {
-                    if let Some(icon) = self.get_file_icon(selected_path) {
-                        egui::Image::new(icon)
-                            .max_size(egui::Vec2::splat(24.0))
-                            .ui(ui);
-                    }
-                    ui.label(format!("Selected file: {}", file_name));
-                });
-                
-                ui.label(format!("Full path: {}", selected_path.display()));
-                
-                // Show file info
-                if let Ok(metadata) = fs::metadata(selected_path) {
-                    let file_size = metadata.len();
-                    ui.label(format!("Size: {} bytes", file_size));
-                    
-                    // File extension info
-                    if let Some(extension) = selected_path.extension().and_then(|e| e.to_str()) {
-                        ui.label(format!("Type: {} file", extension.to_uppercase()));
-                    }
+            // Check if we're viewing a Disney Infinity model
+            if let Some(game_type) = &self.state.selected_game {
+                if matches!(game_type, GameType::DisneyInfinity30) && self.model_viewer.has_model() {
+                    // Show ONLY the model viewer - take the entire central panel
+                    let available_size = ui.available_size();
+                    self.model_viewer.show_ui(ui, available_size);
+                } else {
+                    // Show regular file info in a structured layout
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        if let Some(selected_path) = &self.selected_file {
+                            // Check if we clicked away from IBUF/VBUF files - clear the model
+                            if let Some(extension) = selected_path.extension().and_then(|e| e.to_str()) {
+                                if !extension.eq_ignore_ascii_case("ibuf") && !extension.eq_ignore_ascii_case("vbuf") {
+                                    self.model_viewer.clear_model();
+                                }
+                            }
+                            
+                            ui.heading("File Editor");
+                            ui.separator();
+                            
+                            let file_name = selected_path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("Unknown");
+                            
+                            ui.horizontal(|ui| {
+                                if let Some(icon) = self.get_file_icon(selected_path) {
+                                    egui::Image::new(icon)
+                                        .max_size(egui::Vec2::splat(24.0))
+                                        .ui(ui);
+                                }
+                                ui.label(format!("Selected file: {}", file_name));
+                            });
+                            
+                            ui.label(format!("Full path: {}", selected_path.display()));
+                            
+                            if let Ok(metadata) = fs::metadata(selected_path) {
+                                let file_size = metadata.len();
+                                ui.label(format!("Size: {} bytes", file_size));
+                                
+                                if let Some(extension) = selected_path.extension().and_then(|e| e.to_str()) {
+                                    ui.label(format!("Type: {} file", extension.to_uppercase()));
+                                }
+                            }
+                        } else {
+                            // No file selected - clear the model
+                            self.model_viewer.clear_model();
+                            ui.heading("Tundra");
+                            ui.label("Select a file from the assets folder to begin editing");
+                        }
+                    });
                 }
-            } else {
-                ui.heading("Tundra");
-                ui.label("Select a file from the assets folder to begin editing");
             }
             
-            // "Change Game" button in bottom right
+            // "Run Game", "Options", and "Change Game" buttons in bottom right - show them OVER the model viewer
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                 if ui.button("Change Game").clicked() {
                     self.state.current_step = AppStep::GameSelection;
                     self.save_state();
+                }
+                
+                if ui.button("Options").clicked() {
+                    self.show_options = true;
+                }
+                
+                if ui.button("Run Game").clicked() {
+                    self.run_game();
                 }
             });
         });
