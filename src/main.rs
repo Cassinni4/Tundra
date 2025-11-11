@@ -13,6 +13,9 @@ mod in3;
 use in3::ViewModel;
 use in3::read_zip::DisneyInfinityZipReader;
 
+mod gen;
+use gen::MtbViewer;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum GameType {
     DisneyInfinity30,
@@ -143,6 +146,8 @@ struct TundraEditor {
     scan_progress: Option<ScanProgress>,
     scan_thread: Option<thread::JoinHandle<Vec<FileEntry>>>,
     scan_cancel: Arc<Mutex<bool>>,
+    mtb_viewer: MtbViewer,
+    egui_ctx: Option<egui::Context>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +159,7 @@ struct ScanProgress {
 }
 
 impl TundraEditor {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = PathBuf::from("tundra_config.json");
         
         let mut app = Self {
@@ -170,16 +175,18 @@ impl TundraEditor {
             scan_progress: None,
             scan_thread: None,
             scan_cancel: Arc::new(Mutex::new(false)),
+            mtb_viewer: MtbViewer::new(),
+            egui_ctx: Some(cc.egui_ctx.clone()),
         };
 
         // Load file icons
-        app.load_file_icons(_cc);
+        app.load_file_icons(cc);
 
         // Try to load state from JSON file
         app.load_from_json();
 
         // Apply theme
-        app.apply_theme(_cc);
+        app.apply_theme(cc);
 
         app
     }
@@ -346,7 +353,7 @@ impl TundraEditor {
         self.pending_file_selection = true;
     }
 
-    fn handle_file_dialog(&mut self) {
+    fn handle_file_dialog(&mut self, ctx: &egui::Context) {
         if self.pending_file_selection {
             if let Some(game_type) = self.state.selected_game.clone() {
                 if let Some(file_path) = rfd::FileDialog::new()
@@ -561,6 +568,7 @@ impl TundraEditor {
         self.file_tree.clear();
         self.selected_file = None;
         self.model_viewer.clear_model();
+        self.mtb_viewer.clear();
 
         // Get the directory containing the executable
         if let Some(parent_dir) = executable_path.parent() {
@@ -619,6 +627,7 @@ impl TundraEditor {
         self.file_tree.clear();
         self.selected_file = None;
         self.model_viewer.clear_model();
+        self.mtb_viewer.clear();
 
         // Get the directory containing the executable
         if let Some(parent_dir) = executable_path.parent() {
@@ -676,10 +685,11 @@ impl TundraEditor {
         count
     }
 
-    fn handle_model_file_selection(&mut self, file_path: &PathBuf) {
-        println!("Model file selected: {}", file_path.display());
+    fn handle_model_file_selection(&mut self, file_path: &PathBuf, ctx: &egui::Context) {
+        println!("File selected: {}", file_path.display());
         
         if let Some(extension) = file_path.extension().and_then(|e| e.to_str()) {
+            // Handle model files
             if extension.eq_ignore_ascii_case("ibuf") || extension.eq_ignore_ascii_case("vbuf") {
                 // Find the corresponding file
                 let base_name = file_path.with_extension("");
@@ -711,18 +721,35 @@ impl TundraEditor {
                     println!("Corresponding {} file not found: {}", other_extension, other_file.display());
                     self.model_viewer.clear_model();
                 }
-            } else {
-                // Not a model file, clear the model
-                println!("Not a model file, clearing model viewer");
-                self.model_viewer.clear_model();
+                return;
             }
-        } else {
-            // No extension, clear the model
-            self.model_viewer.clear_model();
+            
+            // Handle MTB and TBODY files for Disney Infinity 3.0
+            if let Some(game_type) = &self.state.selected_game {
+                if matches!(game_type, GameType::DisneyInfinity30) {
+                    if extension.eq_ignore_ascii_case("mtb") {
+                        println!("Loading MTB file: {}", file_path.display());
+                        if let Err(e) = self.mtb_viewer.load_mtb_file(file_path, ctx) {
+                            eprintln!("Failed to load MTB file: {}", e);
+                        }
+                        return;
+                    } else if extension.eq_ignore_ascii_case("tbody") {
+                        println!("Loading TBODY file: {}", file_path.display());
+                        if let Err(e) = self.mtb_viewer.load_tbody_file(file_path, ctx) {
+                            eprintln!("Failed to load TBODY file: {}", e);
+                        }
+                        return;
+                    }
+                }
+            }
         }
+        
+        // Clear both viewers if it's not a supported file type
+        self.model_viewer.clear_model();
+        self.mtb_viewer.clear();
     }
 
-    fn show_file_tree_ui(&mut self, ui: &mut egui::Ui) {
+    fn show_file_tree_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Check if scan is complete
         self.check_scan_completion();
 
@@ -742,11 +769,11 @@ impl TundraEditor {
         }
 
         let mut entries_to_process = std::mem::take(&mut self.file_tree);
-        self.show_file_tree_internal(ui, &mut entries_to_process);
+        self.show_file_tree_internal(ui, &mut entries_to_process, ctx);
         self.file_tree = entries_to_process;
     }
 
-    fn show_file_tree_internal(&mut self, ui: &mut egui::Ui, entries: &mut Vec<FileEntry>) {
+    fn show_file_tree_internal(&mut self, ui: &mut egui::Ui, entries: &mut Vec<FileEntry>, ctx: &egui::Context) {
         for entry in entries {
             let display_name = entry.path.file_name()
                 .and_then(|n| n.to_str())
@@ -793,7 +820,7 @@ impl TundraEditor {
                                         }
                                         
                                         // Show ZIP contents
-                                        self.show_file_tree_internal(ui, &mut entry.children);
+                                        self.show_file_tree_internal(ui, &mut entry.children, ctx);
                                     });
 
                                 if response.header_response.clicked() {
@@ -808,13 +835,7 @@ impl TundraEditor {
                                 let is_selected = self.selected_file.as_ref() == Some(&entry.path);
                                 if ui.selectable_label(is_selected, &display_name).clicked() {
                                     self.selected_file = Some(entry.path.clone());
-                                    
-                                    // Handle model files for Disney Infinity
-                                    if let Some(game_type) = &self.state.selected_game {
-                                        if matches!(game_type, GameType::DisneyInfinity30) {
-                                            self.handle_model_file_selection(&entry.path);
-                                        }
-                                    }
+                                    self.handle_model_file_selection(&entry.path, ctx);
                                 }
                             }
                         }
@@ -827,7 +848,7 @@ impl TundraEditor {
                 let response = egui::CollapsingHeader::new(&display_name)
                     .default_open(initially_open)
                     .show(ui, |ui| {
-                        self.show_file_tree_internal(ui, &mut entry.children);
+                        self.show_file_tree_internal(ui, &mut entry.children, ctx);
                     });
 
                 // Update expanded state based on user interaction
@@ -870,24 +891,12 @@ impl TundraEditor {
                     if is_in_zip {
                         if ui.selectable_label(is_selected, egui::RichText::new(&display_name).color(egui::Color32::GREEN)).clicked() {
                             self.selected_file = Some(entry.path.clone());
-                            
-                            // Handle model files for Disney Infinity
-                            if let Some(game_type) = &self.state.selected_game {
-                                if matches!(game_type, GameType::DisneyInfinity30) {
-                                    self.handle_model_file_selection(&entry.path);
-                                }
-                            }
+                            self.handle_model_file_selection(&entry.path, ctx);
                         }
                     } else {
                         if ui.selectable_label(is_selected, &display_name).clicked() {
                             self.selected_file = Some(entry.path.clone());
-                            
-                            // Handle model files for Disney Infinity
-                            if let Some(game_type) = &self.state.selected_game {
-                                if matches!(game_type, GameType::DisneyInfinity30) {
-                                    self.handle_model_file_selection(&entry.path);
-                                }
-                            }
+                            self.handle_model_file_selection(&entry.path, ctx);
                         }
                     }
                 });
@@ -934,7 +943,7 @@ impl TundraEditor {
         }
     }
 
-    fn show_file_selection(&mut self, ui: &mut egui::Ui) {
+    fn show_file_selection(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Clone the game type to avoid holding reference to self.state
         let game_type = match self.state.selected_game.clone() {
             Some(gt) => gt,
@@ -1054,6 +1063,40 @@ impl TundraEditor {
         }
     }
 
+    fn show_regular_file_info(&mut self, ui: &mut egui::Ui) {
+        if let Some(selected_path) = &self.selected_file {
+            ui.heading("File Editor");
+            ui.separator();
+            
+            let file_name = selected_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown");
+            
+            ui.horizontal(|ui| {
+                if let Some(icon) = self.get_file_icon(selected_path) {
+                    egui::Image::new(icon)
+                        .max_size(egui::Vec2::splat(24.0))
+                        .ui(ui);
+                }
+                ui.label(format!("Selected file: {}", file_name));
+            });
+            
+            ui.label(format!("Full path: {}", selected_path.display()));
+            
+            if let Ok(metadata) = fs::metadata(selected_path) {
+                let file_size = metadata.len();
+                ui.label(format!("Size: {} bytes", file_size));
+                
+                if let Some(extension) = selected_path.extension().and_then(|e| e.to_str()) {
+                    ui.label(format!("Type: {} file", extension.to_uppercase()));
+                }
+            }
+        } else {
+            ui.heading("Tundra");
+            ui.label("Select a file from the assets folder to begin editing");
+        }
+    }
+
     fn show_editor(&mut self, ctx: &egui::Context) {
         // Check scan completion
         self.check_scan_completion();
@@ -1099,7 +1142,7 @@ impl TundraEditor {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            self.show_file_tree_ui(ui);
+                            self.show_file_tree_ui(ui, ctx);
                         });
                 }
             });
@@ -1117,57 +1160,35 @@ impl TundraEditor {
 
         // The rest of the space is for the main area
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Check if we're viewing a Disney Infinity model
+            // Check if we're viewing a Disney Infinity model or textures
             if let Some(game_type) = &self.state.selected_game {
-                if matches!(game_type, GameType::DisneyInfinity30) && self.model_viewer.has_model() {
-                    // Show ONLY the model viewer - take the entire central panel
-                    let available_size = ui.available_size();
-                    self.model_viewer.show_ui(ui, available_size);
+                if matches!(game_type, GameType::DisneyInfinity30) {
+                    // Check what type of content we should show
+                    if self.model_viewer.has_model() {
+                        // Show model viewer
+                        let available_size = ui.available_size();
+                        self.model_viewer.show_ui(ui, available_size);
+                    } else if self.mtb_viewer.has_content() {
+                        // Show MTB/TBODY viewer
+                        let available_size = ui.available_size();
+                        self.mtb_viewer.show_ui(ui, available_size, ctx);
+                    } else {
+                        // Show regular file info
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.show_regular_file_info(ui);
+                        });
+                    }
                 } else {
-                    // Show regular file info in a structured layout
+                    // For other games, show regular file info
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        if let Some(selected_path) = &self.selected_file {
-                            // Check if we clicked away from IBUF/VBUF files - clear the model
-                            if let Some(extension) = selected_path.extension().and_then(|e| e.to_str()) {
-                                if !extension.eq_ignore_ascii_case("ibuf") && !extension.eq_ignore_ascii_case("vbuf") {
-                                    self.model_viewer.clear_model();
-                                }
-                            }
-                            
-                            ui.heading("File Editor");
-                            ui.separator();
-                            
-                            let file_name = selected_path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("Unknown");
-                            
-                            ui.horizontal(|ui| {
-                                if let Some(icon) = self.get_file_icon(selected_path) {
-                                    egui::Image::new(icon)
-                                        .max_size(egui::Vec2::splat(24.0))
-                                        .ui(ui);
-                                }
-                                ui.label(format!("Selected file: {}", file_name));
-                            });
-                            
-                            ui.label(format!("Full path: {}", selected_path.display()));
-                            
-                            if let Ok(metadata) = fs::metadata(selected_path) {
-                                let file_size = metadata.len();
-                                ui.label(format!("Size: {} bytes", file_size));
-                                
-                                if let Some(extension) = selected_path.extension().and_then(|e| e.to_str()) {
-                                    ui.label(format!("Type: {} file", extension.to_uppercase()));
-                                }
-                            }
-                        } else {
-                            // No file selected - clear the model
-                            self.model_viewer.clear_model();
-                            ui.heading("Tundra");
-                            ui.label("Select a file from the assets folder to begin editing");
-                        }
+                        self.show_regular_file_info(ui);
                     });
                 }
+            } else {
+                // No game selected, show regular file info
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.show_regular_file_info(ui);
+                });
             }
             
             // "Run Game", "Options", and "Change Game" buttons in bottom right - show them OVER the model viewer
@@ -1192,7 +1213,7 @@ impl TundraEditor {
 impl eframe::App for TundraEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle file dialog on the main thread
-        self.handle_file_dialog();
+        self.handle_file_dialog(ctx);
 
         match self.state.current_step {
             AppStep::GameSelection => {
@@ -1202,7 +1223,7 @@ impl eframe::App for TundraEditor {
             }
             AppStep::FileSelection => {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    self.show_file_selection(ui);
+                    self.show_file_selection(ui, ctx);
                 });
             }
             AppStep::Editor => {
