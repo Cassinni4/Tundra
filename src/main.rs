@@ -22,6 +22,7 @@ enum GameType {
     Cars2TheVideoGame,
     Cars2Arcade,
     Cars3DrivenToWinXB1,
+    ToyShit3,
 }
 
 impl GameType {
@@ -31,6 +32,7 @@ impl GameType {
             GameType::Cars2TheVideoGame => "Cars 2: The Video Game",
             GameType::Cars2Arcade => "Cars 2 Arcade",
             GameType::Cars3DrivenToWinXB1 => "Cars 3: Driven To Win (Xbox One)",
+            GameType::ToyShit3 => "Toy Story 3",
         }
     }
 
@@ -40,6 +42,7 @@ impl GameType {
             GameType::Cars2TheVideoGame => "Game-Cars.exe",
             GameType::Cars2Arcade => "sdaemon.exe",
             GameType::Cars3DrivenToWinXB1 => "game.consumer.exe",
+            GameType::ToyShit3 => "Game-TS3.exe",
         }
     }
 
@@ -49,11 +52,12 @@ impl GameType {
             GameType::Cars2TheVideoGame,
             GameType::Cars2Arcade,
             GameType::Cars3DrivenToWinXB1,
+            GameType::ToyShit3,
         ]
     }
 
     fn supports_zip_browsing(&self) -> bool {
-        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade | GameType::DisneyInfinity30)
+        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade | GameType::DisneyInfinity30 | GameType::ToyShit3)
     }
 }
 
@@ -148,6 +152,8 @@ struct TundraEditor {
     scan_cancel: Arc<Mutex<bool>>,
     mtb_viewer: MtbViewer,
     egui_ctx: Option<egui::Context>,
+    should_exit: bool,
+    show_crash_dialog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +183,8 @@ impl TundraEditor {
             scan_cancel: Arc::new(Mutex::new(false)),
             mtb_viewer: MtbViewer::new(),
             egui_ctx: Some(cc.egui_ctx.clone()),
+            should_exit: false,
+            show_crash_dialog: false,
         };
 
         // Load file icons
@@ -353,7 +361,7 @@ impl TundraEditor {
         self.pending_file_selection = true;
     }
 
-    fn handle_file_dialog(&mut self, ctx: &egui::Context) {
+    fn handle_file_dialog(&mut self, _ctx: &egui::Context) {
         if self.pending_file_selection {
             if let Some(game_type) = self.state.selected_game.clone() {
                 if let Some(file_path) = rfd::FileDialog::new()
@@ -793,7 +801,7 @@ impl TundraEditor {
                                 .ui(ui);
                         }
                         
-                        // Only show dropdown for Cars 2 games that support ZIP browsing
+                        // Only show dropdown for games that support ZIP browsing
                         if let Some(game_type) = &self.state.selected_game {
                             if game_type.supports_zip_browsing() {
                                 let response = egui::CollapsingHeader::new(&display_name)
@@ -831,7 +839,7 @@ impl TundraEditor {
                                     }
                                 }
                             } else {
-                                // For non-Cars 2 games, just show the ZIP file as a regular file (non-expandable)
+                                // For games that don't support ZIP browsing, just show the ZIP file as a regular file (non-expandable)
                                 let is_selected = self.selected_file.as_ref() == Some(&entry.path);
                                 if ui.selectable_label(is_selected, &display_name).clicked() {
                                     self.selected_file = Some(entry.path.clone());
@@ -874,7 +882,7 @@ impl TundraEditor {
                         ui.add_space(18.0);
                     }
                     
-                    // Files inside ZIPs get green text (only for Cars 2 games that support ZIP browsing)
+                    // Files inside ZIPs get green text (only for games that support ZIP browsing)
                     let is_in_zip = if let Some(game_type) = &self.state.selected_game {
                         game_type.supports_zip_browsing() && entry.path.components().any(|c| {
                             if let std::path::Component::Normal(name) = c {
@@ -943,7 +951,7 @@ impl TundraEditor {
         }
     }
 
-    fn show_file_selection(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_file_selection(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         // Clone the game type to avoid holding reference to self.state
         let game_type = match self.state.selected_game.clone() {
             Some(gt) => gt,
@@ -1063,6 +1071,39 @@ impl TundraEditor {
         }
     }
 
+    fn show_crash_dialog(&mut self, ctx: &egui::Context) {
+        let mut dialog_open = self.show_crash_dialog;
+        
+        egui::Window::new("ruh-oh!")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(egui::Vec2::new(400.0, 200.0))
+            .open(&mut dialog_open)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    
+                    ui.heading("why you modding this game");
+                    ui.add_space(10.0);
+                    
+                    ui.label("ts3 is buns");
+                    ui.label("ts3 modding will never exist");
+                    ui.add_space(20.0);
+                    
+                    ui.label("bye");
+                    ui.add_space(20.0);
+                    
+                    if ui.button("Okay").clicked() {
+                        self.should_exit = true;
+                        self.show_crash_dialog = false;
+                    }
+                });
+            });
+            
+        self.show_crash_dialog = dialog_open;
+    }
+
     fn show_regular_file_info(&mut self, ui: &mut egui::Ui) {
         if let Some(selected_path) = &self.selected_file {
             ui.heading("File Editor");
@@ -1100,6 +1141,23 @@ impl TundraEditor {
     fn show_editor(&mut self, ctx: &egui::Context) {
         // Check scan completion
         self.check_scan_completion();
+
+        // why you playin this fuckass game
+        if let Some(game_type) = &self.state.selected_game {
+            if matches!(game_type, GameType::ToyShit3) && !self.show_crash_dialog && !self.should_exit {
+                let crash_chance = 0.00000005; // 0.000005%
+                if rand::random::<f64>() < crash_chance {
+                    println!("Why the fuck are you modding this game? Remember, Toy Story 3 modding doesn't exist.");
+                    self.show_crash_dialog = true;
+                }
+            }
+        }
+
+        // If crash dialog is showing, show it and block the rest of the UI
+        if self.show_crash_dialog {
+            self.show_crash_dialog(ctx);
+            return; // Block the rest of the UI
+        }
 
         // Use SidePanel for the file list to ensure it takes full height
         egui::SidePanel::left("file_panel")
@@ -1215,6 +1273,12 @@ impl eframe::App for TundraEditor {
         // Handle file dialog on the main thread
         self.handle_file_dialog(ctx);
 
+        // Check if we should exit the application
+        if self.should_exit {
+            println!("TS3 modding will never exist");
+            std::process::exit(0);
+        }
+
         match self.state.current_step {
             AppStep::GameSelection => {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1240,6 +1304,10 @@ impl eframe::App for TundraEditor {
         if let Ok(serialized) = serde_json::to_string(&self.state) {
             storage.set_string("app_state", serialized);
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        println!("Tundra editor is shutting down");
     }
 }
 

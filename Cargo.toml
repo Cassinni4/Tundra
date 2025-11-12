@@ -20,6 +20,7 @@ flate2 = "1.0"
 walkdir = "2.4"
 anyhow = "1.0"
 glam = "0.24"
+rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
