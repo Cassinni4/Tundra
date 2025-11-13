@@ -1078,6 +1078,7 @@ impl TundraEditor {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .title_bar(false)
             .fixed_size(egui::Vec2::new(400.0, 200.0))
             .open(&mut dialog_open)
             .show(ctx, |ui| {
