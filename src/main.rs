@@ -154,6 +154,7 @@ struct TundraEditor {
     egui_ctx: Option<egui::Context>,
     should_exit: bool,
     show_crash_dialog: bool,
+    temp_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +168,12 @@ struct ScanProgress {
 impl TundraEditor {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = PathBuf::from("tundra_config.json");
+        
+        // Create temp directory for ZIP extraction
+        let temp_dir = PathBuf::from("temp");
+        if let Err(e) = fs::create_dir_all(&temp_dir) {
+            eprintln!("Failed to create temp directory: {}", e);
+        }
         
         let mut app = Self {
             state: AppState::default(),
@@ -185,6 +192,7 @@ impl TundraEditor {
             egui_ctx: Some(cc.egui_ctx.clone()),
             should_exit: false,
             show_crash_dialog: false,
+            temp_dir,
         };
 
         // Load file icons
@@ -563,6 +571,84 @@ impl TundraEditor {
         Ok(contents)
     }
 
+    fn extract_zip_to_temp(&self, zip_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        // Create a unique temp directory for this zip file
+        let zip_file_name = zip_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown_zip");
+        
+        let extract_dir = self.temp_dir.join(zip_file_name);
+        
+        // Clear existing directory if it exists
+        if extract_dir.exists() {
+            fs::remove_dir_all(&extract_dir)?;
+        }
+        
+        // Create the directory
+        fs::create_dir_all(&extract_dir)?;
+        
+        println!("Extracting {} to {}", zip_path.display(), extract_dir.display());
+        
+        // Extract based on game type
+        if let Some(game_type) = &self.state.selected_game {
+            if matches!(game_type, GameType::DisneyInfinity30) && DisneyInfinityZipReader::is_disney_infinity_zip(zip_path) {
+                // Use Disney Infinity extraction
+                let entries = DisneyInfinityZipReader::read_zip_contents(zip_path)?;
+                
+                for entry in entries {
+                    if !entry.is_directory {
+                        match DisneyInfinityZipReader::extract_file(zip_path, &entry) {
+                            Ok(content) => {
+                                let file_path = extract_dir.join(&entry.name);
+                                
+                                // Create parent directories if needed
+                                if let Some(parent) = file_path.parent() {
+                                    fs::create_dir_all(parent)?;
+                                }
+                                
+                                fs::write(&file_path, content)?;
+                                println!("Extracted: {}", entry.name);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to extract {}: {}", entry.name, e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Use regular zip extraction
+                let file = fs::File::open(zip_path)?;
+                let mut archive = zip::ZipArchive::new(file)?;
+                
+                for i in 0..archive.len() {
+                    let mut file = archive.by_index(i)?;
+                    let file_name = file.name().to_string();
+                    
+                    // Skip directories (they're created automatically)
+                    if file_name.ends_with('/') {
+                        continue;
+                    }
+                    
+                    let file_path = extract_dir.join(&file_name);
+                    
+                    // Create parent directories if needed
+                    if let Some(parent) = file_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    
+                    let mut content = Vec::new();
+                    file.read_to_end(&mut content)?;
+                    
+                    fs::write(&file_path, content)?;
+                    println!("Extracted: {}", file_name);
+                }
+            }
+        }
+        
+        println!("Extraction complete: {} files extracted", extract_dir.display());
+        Ok(extract_dir)
+    }
+
     fn scan_assets_folder(&mut self, executable_path: &Path) {
         // Cancel any ongoing scan
         *self.scan_cancel.lock().unwrap() = true;
@@ -800,7 +886,7 @@ impl TundraEditor {
                                 .max_size(egui::Vec2::splat(16.0))
                                 .ui(ui);
                         }
-                        
+                    
                         // Only show dropdown for games that support ZIP browsing
                         if let Some(game_type) = &self.state.selected_game {
                             if game_type.supports_zip_browsing() {
@@ -809,20 +895,26 @@ impl TundraEditor {
                                     .show(ui, |ui| {
                                         // Load ZIP contents if not already loaded
                                         if !entry.zip_contents_loaded {
-                                            match self.read_zip_contents(&entry.path) {
-                                                Ok(zip_entries) => {
-                                                    // Convert zip entries to file entries
-                                                    for zip_entry in zip_entries {
-                                                        let virtual_path = entry.path.join(&zip_entry.name);
-                                                        let mut file_entry = FileEntry::new(virtual_path, zip_entry.is_directory);
-                                                        file_entry.is_zip = false;
-                                                        entry.children.push(file_entry);
+                                            // Extract ZIP to temp directory and scan it
+                                            match self.extract_zip_to_temp(&entry.path) {
+                                                Ok(extract_dir) => {
+                                                    // Scan the extracted directory
+                                                    let cancel_flag = Arc::new(Mutex::new(false));
+                                                    let extracted_entries = Self::scan_directory_threaded(extract_dir, cancel_flag);
+                                                    
+                                                    // Add extracted entries as children
+                                                    for mut extracted_entry in extracted_entries {
+                                                        // Mark these as extracted files (not ZIPs)
+                                                        extracted_entry.is_zip = false;
+                                                        entry.children.push(extracted_entry);
                                                     }
+                                                    
                                                     entry.zip_contents_loaded = true;
+                                                    println!("ZIP contents loaded and extracted to temp directory");
                                                 }
                                                 Err(e) => {
                                                     ui.colored_label(egui::Color32::RED, 
-                                                        format!("Failed to read ZIP: {}", e));
+                                                        format!("Failed to extract ZIP: {}", e));
                                                 }
                                             }
                                         }
@@ -881,22 +973,26 @@ impl TundraEditor {
                         // Placeholder for files without icons
                         ui.add_space(18.0);
                     }
-                    
-                    // Files inside ZIPs get green text (only for games that support ZIP browsing)
-                    let is_in_zip = if let Some(game_type) = &self.state.selected_game {
-                        game_type.supports_zip_browsing() && entry.path.components().any(|c| {
+                
+                    // Check if this file is from a ZIP extraction (in temp directory)
+                    let is_extracted_from_zip = entry.path.starts_with(&self.temp_dir);
+                
+                    // Files inside ZIPs or extracted from ZIPs get green text (only for games that support ZIP browsing)
+                    let should_be_green = if let Some(game_type) = &self.state.selected_game {
+                        game_type.supports_zip_browsing() && 
+                        (entry.path.components().any(|c| {
                             if let std::path::Component::Normal(name) = c {
                                 if let Some(name_str) = name.to_str() {
                                     return name_str.to_lowercase().ends_with(".zip");
                                 }
                             }
                             false
-                        })
+                        }) || is_extracted_from_zip)
                     } else {
                         false
                     };
-                    
-                    if is_in_zip {
+                
+                    if should_be_green {
                         if ui.selectable_label(is_selected, egui::RichText::new(&display_name).color(egui::Color32::GREEN)).clicked() {
                             self.selected_file = Some(entry.path.clone());
                             self.handle_model_file_selection(&entry.path, ctx);
@@ -1309,6 +1405,13 @@ impl eframe::App for TundraEditor {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         println!("Tundra editor is shutting down");
+        
+        // Clean up temp directory
+        if let Err(e) = fs::remove_dir_all(&self.temp_dir) {
+            eprintln!("Failed to clean up temp directory: {}", e);
+        } else {
+            println!("Cleaned up temp directory: {}", self.temp_dir.display());
+        }
     }
 }
 
