@@ -457,7 +457,7 @@ impl TundraEditor {
                     .and_then(|n| n.to_str())
                     .unwrap_or_default();
 
-                // Cars 3 specific ignore list
+                // Cars 3/macOS garbage ignore list
                 let ignore = [
                     "appdata.bin",
                     "appxmanifest.xml",
@@ -472,10 +472,11 @@ impl TundraEditor {
                     "subheaps.xml",
                     "threadmonitor.dll",
                     "update",
-                    "Update.AlignmentChunk"
+                    "Update.AlignmentChunk",
+                    ".DS_Store"
                 ];
 
-                if ignore.contains(&file_name) {
+                if ignore.contains(&file_name) || file_name.starts_with("._") {
                     continue;
                 }
 
