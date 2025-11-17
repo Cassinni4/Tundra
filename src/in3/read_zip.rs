@@ -291,6 +291,7 @@ impl DisneyInfinityZipReader {
             compressed_size: header.compressed_size,
             uncompressed_size: header.uncompressed_size,
             compression_method: header.compression,
+            extra_field_length: header.extra_field_length
         })
     }
 
@@ -312,7 +313,7 @@ impl DisneyInfinityZipReader {
         let mut reader = std::io::BufReader::new(file);
         
         // Seek to the file data (header offset + header size + file name + extra field)
-        let data_offset = entry.header_offset as u64 + 30 + entry.name.len() as u64;
+        let data_offset = entry.header_offset as u64 + 30 + entry.name.len() as u64 + entry.extra_field_length as u64;
         reader.seek(SeekFrom::Start(data_offset))?;
         
         // Read compressed data
@@ -332,14 +333,26 @@ impl DisneyInfinityZipReader {
         if entry.compression_method == 0 {
             // Store - no compression
             Ok(compressed_data)
-        } else if entry.compression_method == 8 {
-            // Deflate
-            let mut decoder = flate2::read::DeflateDecoder::new(&compressed_data[..]);
-            let mut decompressed_data = Vec::new();
-            decoder.read_to_end(&mut decompressed_data)?;
-            Ok(decompressed_data)
         } else {
-            Err(format!("Unsupported compression method: {}", entry.compression_method).into())
+            let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
+            let mut decompressed_data = Vec::new();
+
+            // Try zlib
+            if decoder.read_to_end(&mut decompressed_data).is_ok() && decompressed_data.len() == entry.uncompressed_size as usize {
+                println!("Successfully decompressed {}", entry.name);
+                return Ok(decompressed_data);
+            }
+
+            // Try deflate if zlib fails
+            decompressed_data.clear();
+            reader.seek(SeekFrom::Start(data_offset))?;
+            let mut decoder = flate2::read::DeflateDecoder::new(&compressed_data[..]);
+            if decoder.read_to_end(&mut decompressed_data).is_ok() && decompressed_data.len() == entry.uncompressed_size as usize {
+                println!("Successfully decompressed {}", entry.name);
+                return Ok(decompressed_data);
+            } else {
+                return Err(format!("Failed to decompress {}", entry.name).into());
+            }
         }
     }
 }
@@ -352,4 +365,5 @@ pub struct DisneyInfinityZipEntry {
     pub compressed_size: u32,
     pub uncompressed_size: u32,
     pub compression_method: u16,
+    pub extra_field_length: u16
 }
