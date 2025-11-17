@@ -14,7 +14,7 @@ fn map_string_to_bytes(string: &String) -> &[u8] {
 
 #[derive(BinRead, Debug)]
 #[brw(little)]
-struct ZipLocalFileHeader {
+pub struct ZipLocalFileHeader {
     #[br(assert(signature == 0x04034b50, "Invalid local file header signature"))]
     pub signature: u32,
     pub version: u16,
@@ -31,7 +31,7 @@ struct ZipLocalFileHeader {
 
 #[binrw]
 #[brw(little, magic = b"PK\x01\x02")]
-struct ZipDirEntry {
+pub struct ZipDirEntry {
     pub version_made_by: u16,
     pub version_to_extract: u16,
     pub flags: u16,
@@ -70,7 +70,7 @@ const MD5_EXTRA_FIELD_SIZE: usize = MD5_HEADER.len() + 16;
 
 #[binrw]
 #[brw(little, magic = b"PK\x05\x06")]
-struct ZipDirEndLocator {
+pub struct ZipDirEndLocator {
     pub disk_number: u16,
     pub disk_start_number: u16,
     pub entries_on_disk: u16,

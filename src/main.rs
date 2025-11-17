@@ -15,6 +15,11 @@ use in3::read_zip::DisneyInfinityZipReader;
 
 mod gen;
 use gen::MtbViewer;
+use gen::read_scene::{SceneFileHandler, GameType as SceneGameType};
+
+// Import Cars 3 ZIP reader
+mod c3dtw;
+use c3dtw::read_zip::DrivenToWinZip;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum GameType {
@@ -57,7 +62,11 @@ impl GameType {
     }
 
     fn supports_zip_browsing(&self) -> bool {
-        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade | GameType::DisneyInfinity30 | GameType::ToyShit3)
+        matches!(self, GameType::Cars2TheVideoGame | GameType::Cars2Arcade | GameType::DisneyInfinity30 | GameType::ToyShit3 | GameType::Cars3DrivenToWinXB1)
+    }
+
+    fn uses_special_zip_reader(&self) -> bool {
+        matches!(self, GameType::DisneyInfinity30 | GameType::Cars3DrivenToWinXB1)
     }
 }
 
@@ -137,6 +146,13 @@ struct ZipEntry {
     is_directory: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum SceneTabs {
+    SceneInfo,
+    Textures,
+    Animations,
+}
+
 struct TundraEditor {
     state: AppState,
     pending_file_selection: bool,
@@ -155,6 +171,9 @@ struct TundraEditor {
     should_exit: bool,
     show_crash_dialog: bool,
     temp_dir: PathBuf,
+    scene_viewer: SceneFileHandler,
+    show_scene_viewer: bool,
+    scene_tabs: SceneTabs,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +212,9 @@ impl TundraEditor {
             should_exit: false,
             show_crash_dialog: false,
             temp_dir,
+            scene_viewer: SceneFileHandler::new(),
+            show_scene_viewer: false,
+            scene_tabs: SceneTabs::SceneInfo,
         };
 
         // Load file icons
@@ -312,6 +334,7 @@ impl TundraEditor {
             ("lua", "src/art/lua.png"),
             ("wem", "src/art/wem.png"),
             ("zip", "src/art/zip.png"),
+            ("oct", "src/art/oct.png"),
         ];
 
         for (extension, path) in icon_files.iter() {
@@ -527,6 +550,33 @@ impl TundraEditor {
                     println!("Not a Disney Infinity encrypted zip, trying regular zip");
                 }
             }
+            
+            // Check if this is a Cars 3 zip
+            if matches!(game_type, GameType::Cars3DrivenToWinXB1) {
+                println!("Attempting to read as Cars 3 zip: {}", zip_path.display());
+                
+                match DrivenToWinZip::read_zip_contents(zip_path) {
+                    Ok(c3_entries) => {
+                        println!("Successfully read {} Cars 3 zip entries", c3_entries.len());
+                        // Convert ZipDirEntry to our local ZipEntry
+                        let entries: Vec<ZipEntry> = c3_entries
+                            .into_iter()
+                            .map(|c3_entry| {
+                                let name = c3_entry.file_name.clone();
+                                ZipEntry {
+                                    name: name.clone(),
+                                    is_directory: name.ends_with('/'),
+                                }
+                            })
+                            .collect();
+                        return Ok(entries);
+                    }
+                    Err(e) => {
+                        println!("Cars 3 zip reading failed: {}", e);
+                        // Fall through to regular zip reading
+                    }
+                }
+            }
         }
         
         // Regular zip reading
@@ -539,7 +589,7 @@ impl TundraEditor {
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
             let is_directory = file.name().ends_with('/');
-    
+        
             entries.push(ZipEntry {
                 name: file.name().to_string(),
                 is_directory,
@@ -557,6 +607,16 @@ impl TundraEditor {
                 let entries = DisneyInfinityZipReader::read_zip_contents(zip_path)?;
                 if let Some(entry) = entries.iter().find(|e| e.name == entry_name) {
                     return DisneyInfinityZipReader::extract_file(zip_path, entry);
+                }
+            }
+            
+            if matches!(game_type, GameType::Cars3DrivenToWinXB1) {
+                // Try to extract using Cars 3 zip reader
+                let entries = DrivenToWinZip::read_zip_contents(zip_path)?;
+                if let Some(entry) = entries.into_iter().find(|e| e.file_name == entry_name) {
+                    println!("Extracting Cars 3 zip file: {}", entry_name);
+                    let mut file = fs::File::open(zip_path)?;
+                    return DrivenToWinZip::extract_zip_file(entry, &mut file);
                 }
             }
         }
@@ -616,6 +676,32 @@ impl TundraEditor {
                         }
                     }
                 }
+            } else if matches!(game_type, GameType::Cars3DrivenToWinXB1) {
+                // Use Cars 3 extraction
+                let entries = DrivenToWinZip::read_zip_contents(zip_path)?;
+                let mut file = fs::File::open(zip_path)?;
+                
+                for entry in entries {
+                    let file_name = entry.file_name.clone();
+                    if !file_name.ends_with('/') {
+                        match DrivenToWinZip::extract_zip_file(entry, &mut file) {
+                            Ok(content) => {
+                                let file_path = extract_dir.join(&file_name);
+                                
+                                // Create parent directories if needed
+                                if let Some(parent) = file_path.parent() {
+                                    fs::create_dir_all(parent)?;
+                                }
+                                
+                                fs::write(&file_path, content)?;
+                                println!("Extracted: {}", file_name);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to extract {}: {}", file_name, e);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Use regular zip extraction
                 let file = fs::File::open(zip_path)?;
@@ -664,6 +750,8 @@ impl TundraEditor {
         self.selected_file = None;
         self.model_viewer.clear_model();
         self.mtb_viewer.clear();
+        self.scene_viewer.clear();
+        self.show_scene_viewer = false;
 
         // Get the directory containing the executable
         if let Some(parent_dir) = executable_path.parent() {
@@ -723,6 +811,8 @@ impl TundraEditor {
         self.selected_file = None;
         self.model_viewer.clear_model();
         self.mtb_viewer.clear();
+        self.scene_viewer.clear();
+        self.show_scene_viewer = false;
 
         // Get the directory containing the executable
         if let Some(parent_dir) = executable_path.parent() {
@@ -783,7 +873,63 @@ impl TundraEditor {
     fn handle_model_file_selection(&mut self, file_path: &PathBuf, ctx: &egui::Context) {
         println!("File selected: {}", file_path.display());
         
+        // Clear scene viewer when non-scene files are selected
         if let Some(extension) = file_path.extension().and_then(|e| e.to_str()) {
+            if !extension.eq_ignore_ascii_case("oct") {
+                self.show_scene_viewer = false;
+                self.scene_viewer.clear();
+            } else {
+                // For .oct files, automatically try to find and load corresponding .bent file
+                let bent_path = SceneFileHandler::find_corresponding_bent_file(file_path);
+                if let Some(bent_path) = bent_path {
+                    println!("Found corresponding .bent file: {}", bent_path.display());
+                    if let Err(e) = self.scene_viewer.load_bent_file(&bent_path) {
+                        println!("Failed to load .bent file: {}", e);
+                    } else {
+                        println!("Successfully loaded animation data from .bent file");
+                    }
+                } else {
+                    println!("No corresponding .bent file found for: {}", file_path.display());
+                }
+                // Show scene viewer for .oct files
+                self.show_scene_viewer = true;
+            }
+        }
+        
+        if let Some(extension) = file_path.extension().and_then(|e| e.to_str()) {
+            // Handle scene files (OCT files)
+            if extension.eq_ignore_ascii_case("oct") {
+                println!("Loading scene file: {}", file_path.display());
+                match std::fs::File::open(file_path) {
+                    Ok(mut file) => {
+                        if let Err(e) = self.scene_viewer.load_scene_file(&mut file) {
+                            eprintln!("Failed to load scene file: {}", e);
+                        } else {
+                            // Extract textures for supported games
+                            if let Some(game_type) = &self.state.selected_game {
+                                // Convert main GameType to scene GameType
+                                let scene_game_type = match game_type {
+                                    GameType::ToyShit3 => SceneGameType::ToyShit3,
+                                    GameType::Cars2Arcade => SceneGameType::Cars2Arcade,
+                                    GameType::Cars2TheVideoGame => SceneGameType::Cars2TheVideoGame,
+                                    GameType::DisneyInfinity30 => SceneGameType::DisneyInfinity30,
+                                    GameType::Cars3DrivenToWinXB1 => SceneGameType::Cars3DrivenToWinXB1,
+                                };
+                                if let Err(e) = self.scene_viewer.extract_textures(&scene_game_type) {
+                                    eprintln!("Failed to extract textures: {}", e);
+                                }
+                            }
+                            self.show_scene_viewer = true;
+                            println!("Scene file loaded successfully");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to open scene file: {}", e);
+                    }
+                }
+                return;
+            }
+                
             // Handle model files
             if extension.eq_ignore_ascii_case("ibuf") || extension.eq_ignore_ascii_case("vbuf") {
                 // Find the corresponding file
@@ -1008,6 +1154,221 @@ impl TundraEditor {
             }
         }
     }
+
+fn show_scene_viewer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    if !self.show_scene_viewer || !self.scene_viewer.has_scene_loaded() {
+        return;
+    }
+
+    ui.heading("Scene Viewer");
+    ui.separator();
+
+    // Scene tabs
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut self.scene_tabs, SceneTabs::SceneInfo, "Scene Info");
+        if self.scene_viewer.has_textures() {
+            ui.selectable_value(&mut self.scene_tabs, SceneTabs::Textures, "Textures");
+        }
+        ui.selectable_value(&mut self.scene_tabs, SceneTabs::Animations, "Animations"); // Changed from Properties
+    });
+
+    ui.separator();
+
+    match self.scene_tabs {
+        SceneTabs::SceneInfo => {
+            ui.label("Scene file loaded successfully");
+            if let Some(endian) = &self.scene_viewer.endian {
+                ui.label(format!("Endian: {:?}", endian));
+            }
+            ui.label(format!("Extracted textures: {}", self.scene_viewer.extracted_textures.len()));
+            
+            // Show supported game info
+            ui.separator();
+            ui.label("Texture extraction supported for:");
+            ui.label("• Toy Story 3");
+            ui.label("• Cars 2 Arcade"); 
+            ui.label("• Cars 2: The Video Game");
+        }
+        SceneTabs::Textures => {
+            if self.scene_viewer.has_textures() {
+                ui.label(format!("Found {} textures:", self.scene_viewer.extracted_textures.len()));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for texture in &self.scene_viewer.extracted_textures {
+                        ui.horizontal(|ui| {
+                            if let Some(icon) = self.file_icons.get("oct") {
+                                egui::Image::new(icon)
+                                    .max_size(egui::Vec2::splat(16.0))
+                                    .ui(ui);
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(&texture.name);
+                                ui.label(format!("Size: {} bytes", texture.data.len()));
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+            } else {
+                ui.label("No textures extracted from this scene file");
+            }
+        }
+        SceneTabs::Animations => {
+            self.show_animations_tab(ui, ctx);
+        }
+    }
+
+    ui.separator();
+    if ui.button("Close Scene Viewer").clicked() {
+        self.show_scene_viewer = false;
+        self.scene_viewer.clear();
+    }
+}
+
+fn show_animations_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    // Try to load corresponding .bent file if not already loaded
+    if let Some(selected_file) = &self.selected_file {
+        if selected_file.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("oct")) {
+            let bent_path = SceneFileHandler::find_corresponding_bent_file(selected_file);
+            
+            if let Some(bent_path) = bent_path {
+                if !self.scene_viewer.has_animation_data() {
+                    ui.label("Loading animation data...");
+                    if let Err(e) = self.scene_viewer.load_bent_file(&bent_path) {
+                        ui.colored_label(egui::Color32::RED, 
+                            format!("Failed to load animation file: {}", e));
+                    } else {
+                        ui.colored_label(egui::Color32::GREEN, 
+                            "Animation data loaded successfully!");
+                    }
+                }
+            } else {
+                ui.label("No corresponding .bent file found for this scene.");
+                ui.label(format!("Expected file: {}", selected_file.with_extension("bent").display()));
+            }
+        }
+    }
+
+    if self.scene_viewer.has_animation_data() {
+        ui.label("Available Animations:");
+        
+        let animation_names = self.scene_viewer.get_animation_names();
+        if animation_names.is_empty() {
+            ui.label("No animations found in this .bent file.");
+        } else {
+            // Collect animation info first to avoid borrowing issues
+            let animations: Vec<(String, String)> = animation_names
+                .iter()
+                .filter_map(|name| {
+                    self.scene_viewer.get_animation_info(name)
+                        .map(|info| (name.clone(), info.filename.clone()))
+                })
+                .collect();
+            
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (anim_name, filename) in animations {
+                    ui.horizontal(|ui| {
+                        if ui.button("▶").clicked() {
+                            // Try to load the animation .oct file
+                            self.load_animation_file(&filename, ctx);
+                        }
+                        
+                        ui.vertical(|ui| {
+                            ui.label(&anim_name);
+                            ui.small(&filename);
+                            
+                            // Show metadata if available (we need to get this separately)
+                            if let Some(anim_info) = self.scene_viewer.get_animation_info(&anim_name) {
+                                if let Some(metadata) = &anim_info.metadata {
+                                    for (key, value) in metadata {
+                                        ui.small(format!("{}: {:?}", key, value));
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+        }
+        
+        // Show animation channels if available
+        if let Some(animation_data) = &self.scene_viewer.animation_data {
+            if !animation_data.channels.is_empty() {
+                ui.separator();
+                ui.label("Animation Channels:");
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for channel in &animation_data.channels {
+                        ui.horizontal(|ui| {
+                            ui.label(&channel.name);
+                            if let Some(priority) = channel.priority_order {
+                                ui.label(format!("Priority: {:.1}", priority));
+                            }
+                            if let Some(index) = channel.channel_index {
+                                ui.label(format!("Index: {}", index));
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    } else {
+        ui.label("No animation data available.");
+        ui.label("Animation data is loaded from .bent files with the same name as the .oct file.");
+    }
+}
+
+fn load_animation_file(&mut self, filename: &str, ctx: &egui::Context) {
+    println!("Attempting to load animation file: {}", filename);
+    
+    // Try to find the animation file in the file tree
+    let animation_path = self.find_file_in_tree(&filename);
+    
+    if let Some(path) = animation_path {
+        println!("Found animation file at: {}", path.display());
+        self.selected_file = Some(path.clone());
+        self.handle_model_file_selection(&path, ctx);
+    } else {
+        println!("Animation file not found in scanned directories: {}", filename);
+        
+        // Try to construct path relative to current scene
+        if let Some(current_scene_path) = &self.selected_file {
+            if let Some(parent_dir) = current_scene_path.parent() {
+                let potential_path = parent_dir.join(filename);
+                if potential_path.exists() {
+                    println!("Found animation file at constructed path: {}", potential_path.display());
+                    self.selected_file = Some(potential_path.clone());
+                    self.handle_model_file_selection(&potential_path, ctx);
+                } else {
+                    println!("Animation file not found at: {}", potential_path.display());
+                }
+            }
+        }
+    }
+}
+
+fn find_file_in_tree(&self, filename: &str) -> Option<PathBuf> {
+    self.search_file_tree(&self.file_tree, filename)
+}
+
+fn search_file_tree(&self, entries: &[FileEntry], target_filename: &str) -> Option<PathBuf> {
+    for entry in entries {
+        if !entry.is_directory && !entry.is_zip {
+            if let Some(entry_filename) = entry.path.file_name() {
+                if entry_filename.to_string_lossy().eq_ignore_ascii_case(target_filename) {
+                    return Some(entry.path.clone());
+                }
+            }
+        }
+        
+        // Search in children (recursive)
+        if !entry.children.is_empty() {
+            if let Some(found) = self.search_file_tree(&entry.children, target_filename) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 
     fn show_game_selection(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tundra");
@@ -1302,6 +1663,16 @@ impl TundraEditor {
                         });
                 }
             });
+
+        // Scene viewer panel (right side) - only show if a scene file is loaded
+        if self.show_scene_viewer {
+            egui::SidePanel::right("scene_panel")
+                .resizable(true)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    self.show_scene_viewer(ui, ctx);
+                });
+        }
 
         // Show options window if needed
         if self.show_options {

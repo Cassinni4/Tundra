@@ -12,11 +12,13 @@ pub struct MtbTextureInfo {
 pub struct MtbFile {
     pub textures: Vec<MtbTextureInfo>,
     pub file_path: PathBuf,
+    pub is_ui_mtb: bool,
 }
 
 impl MtbFile {
     pub fn parse_from_bytes(data: &[u8], file_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let mut textures = Vec::new();
+        let mut is_ui_mtb = false;
 
         // Find the TEXB header
         let texb_header = b"TEXB";
@@ -42,6 +44,7 @@ impl MtbFile {
                 return Ok(MtbFile {
                     textures,
                     file_path: file_path.to_path_buf(),
+                    is_ui_mtb,
                 });
             }
         };
@@ -52,23 +55,34 @@ impl MtbFile {
         // Debug the TEXB section
         Self::debug_texb_section(data, texb_start);
 
-        // Parse the TEXB section structure
-        textures.extend_from_slice(&Self::parse_texb_section_corrected(data, cursor));
+        // Check if this is a UI MTB by looking for MATP header
+        let matp_header = b"MATP";
+        let has_matp = data[texb_start..].windows(4).any(|window| window == matp_header);
+        
+        if has_matp {
+            println!("Detected normal MTB (has MATP section)");
+            textures.extend_from_slice(&Self::parse_normal_texb_section(data, cursor));
+        } else {
+            println!("Detected UI MTB (no MATP section)");
+            is_ui_mtb = true;
+            textures.extend_from_slice(&Self::parse_ui_texb_section(data, cursor));
+        }
 
         println!("Extracted {} valid textures from TEXB section", textures.len());
 
         Ok(MtbFile {
             textures,
             file_path: file_path.to_path_buf(),
+            is_ui_mtb,
         })
     }
 
-    fn parse_texb_section_corrected(data: &[u8], start: usize) -> Vec<MtbTextureInfo> {
+    fn parse_normal_texb_section(data: &[u8], start: usize) -> Vec<MtbTextureInfo> {
         let mut textures = Vec::new();
         let mut cursor = start;
         let matp_header = b"MATP";
 
-        println!("Parsing TEXB section with corrected structure");
+        println!("Parsing normal MTB TEXB section");
 
         // Read texture count (little endian u32)
         if cursor + 4 > data.len() {
@@ -158,21 +172,127 @@ impl MtbFile {
         textures
     }
 
+    fn parse_ui_texb_section(data: &[u8], start: usize) -> Vec<MtbTextureInfo> {
+        let mut textures = Vec::new();
+        let mut cursor = start;
+
+        println!("Parsing UI MTB TEXB section");
+
+        // Read texture count (little endian u32)
+        if cursor + 4 > data.len() {
+            return textures;
+        }
+        let texture_count = u32::from_le_bytes([data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]]) as usize;
+        cursor += 4;
+
+        println!("UI Texture count: {}", texture_count);
+
+        // Read section size (little endian u32)
+        if cursor + 4 > data.len() {
+            return textures;
+        }
+        let section_size = u32::from_le_bytes([data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]]);
+        cursor += 4;
+        println!("UI Section size: 0x{:08X} ({} bytes)", section_size, section_size);
+
+        // Read actual texture count for UI MTB
+        if cursor + 4 > data.len() {
+            return textures;
+        }
+        let actual_texture_count = u32::from_le_bytes([data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]]) as usize;
+        cursor += 4;
+        println!("UI Actual texture count: {}", actual_texture_count);
+
+        // The next bytes are the material name string length (u32) followed by the string
+        if cursor + 4 > data.len() {
+            return textures;
+        }
+        let string_length = u32::from_le_bytes([data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]]) as usize;
+        cursor += 4;
+        println!("UI Material name length: {}", string_length);
+
+        // Read the material name string
+        if cursor + string_length > data.len() {
+            println!("Not enough data for material name (need {} bytes)", string_length);
+            return textures;
+        }
+        
+        let string_bytes = &data[cursor..cursor + string_length];
+        let material_name = String::from_utf8_lossy(string_bytes);
+        println!("UI Material name: '{}' (length: {})", material_name, string_length);
+    
+        // Skip the string
+        cursor += string_length;
+
+        // Skip any padding to align to 4-byte boundary
+        while cursor % 4 != 0 && cursor < data.len() {
+            cursor += 1;
+        }
+
+        println!("UI Texture data starts at: 0x{:X}", cursor);
+
+        // UI MTB texture entries are 8 bytes each
+        for i in 0..actual_texture_count {
+            // Safety check - make sure we have enough data
+            if cursor + 8 > data.len() {
+                println!("Not enough data for UI texture entry {} (need 8 bytes, have {} bytes)", 
+                    i, data.len() - cursor);
+                break;
+            }
+
+            let texture_bytes = &data[cursor..cursor + 8];
+
+            // Convert the 8 bytes to hex filename
+            let hex_filename = texture_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
+
+            let tbody_filename = format!("{}.tbody", hex_filename);
+
+            // Create a readable name from the hex for display
+            let name = format!("texture_{}", i);
+
+            println!("UI Texture {} at 0x{:X}: bytes {:02X?} -> {}", 
+                i, cursor, texture_bytes, tbody_filename);
+
+            textures.push(MtbTextureInfo {
+                name,
+                tbody_filename,
+                offset: cursor,
+            });
+        
+            cursor += 8;
+        }
+
+        textures
+    }
+
     fn debug_texb_section(data: &[u8], texb_start: usize) {
         println!("=== TEXB Section Debug ===");
         
         // Show bytes from TEXB header to MATP header or reasonable limit
         let matp_header = b"MATP";
         let mut section_end = texb_start + 200; // Default limit
-        for i in texb_start..data.len().min(texb_start + 500) {
-            if i + 4 <= data.len() && &data[i..i + 4] == matp_header {
-                section_end = i;
-                println!("Found MATP header at: 0x{:X}", i);
-                break;
+        
+        // Check if this has MATP header
+        let has_matp = data[texb_start..].windows(4).any(|window| window == matp_header);
+        
+        if has_matp {
+            for i in texb_start..data.len().min(texb_start + 500) {
+                if i + 4 <= data.len() && &data[i..i + 4] == matp_header {
+                    section_end = i;
+                    println!("Found MATP header at: 0x{:X}", i);
+                    break;
+                }
             }
+        } else {
+            // For UI MTB, show more data since there's no MATP header
+            section_end = (texb_start + 300).min(data.len());
+            println!("No MATP header found (UI MTB)");
         }
 
-        println!("TEXB section from 0x{:X} to 0x{:X}", texb_start, section_end);
+        println!("TEXB section from 0x{:X} to 0x{:X} (data len: 0x{:X})", texb_start, section_end, data.len());
         
         for i in (texb_start..section_end).step_by(16) {
             let line_end = (i + 16).min(section_end);
