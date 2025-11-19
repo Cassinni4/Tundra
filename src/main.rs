@@ -1225,96 +1225,111 @@ fn show_scene_viewer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 fn show_animations_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-    // Try to load corresponding .bent file if not already loaded
-    if let Some(selected_file) = &self.selected_file {
-        if selected_file.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("oct")) {
-            let bent_path = SceneFileHandler::find_corresponding_bent_file(selected_file);
-            
-            if let Some(bent_path) = bent_path {
-                if !self.scene_viewer.has_animation_data() {
-                    ui.label("Loading animation data...");
-                    if let Err(e) = self.scene_viewer.load_bent_file(&bent_path) {
-                        ui.colored_label(egui::Color32::RED, 
-                            format!("Failed to load animation file: {}", e));
-                    } else {
-                        ui.colored_label(egui::Color32::GREEN, 
-                            "Animation data loaded successfully!");
-                    }
-                }
-            } else {
-                ui.label("No corresponding .bent file found for this scene.");
-                ui.label(format!("Expected file: {}", selected_file.with_extension("bent").display()));
-            }
-        }
-    }
-
-    if self.scene_viewer.has_animation_data() {
-        ui.label("Available Animations:");
-        
-        let animation_names = self.scene_viewer.get_animation_names();
-        if animation_names.is_empty() {
-            ui.label("No animations found in this .bent file.");
-        } else {
-            // Collect animation info first to avoid borrowing issues
-            let animations: Vec<(String, String)> = animation_names
-                .iter()
-                .filter_map(|name| {
-                    self.scene_viewer.get_animation_info(name)
-                        .map(|info| (name.clone(), info.filename.clone()))
-                })
-                .collect();
-            
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (anim_name, filename) in animations {
-                    ui.horizontal(|ui| {
-                        if ui.button("▶").clicked() {
-                            // Try to load the animation .oct file
-                            self.load_animation_file(&filename, ctx);
+    // Use a consistent ID for the animations tab
+    ui.push_id("animations_tab", |ui| {
+        // Try to load corresponding .bent file if not already loaded
+        if let Some(selected_file) = &self.selected_file {
+            if selected_file.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("oct")) {
+                let bent_path = SceneFileHandler::find_corresponding_bent_file(selected_file);
+                
+                if let Some(bent_path) = bent_path {
+                    if !self.scene_viewer.has_animation_data() {
+                        ui.label("Loading animation data...");
+                        if let Err(e) = self.scene_viewer.load_bent_file(&bent_path) {
+                            ui.colored_label(egui::Color32::RED, 
+                                format!("Failed to load animation file: {}", e));
+                        } else {
+                            ui.colored_label(egui::Color32::GREEN, 
+                                "Animation data loaded successfully!");
                         }
-                        
-                        ui.vertical(|ui| {
-                            ui.label(&anim_name);
-                            ui.small(&filename);
-                            
-                            // Show metadata if available (we need to get this separately)
-                            if let Some(anim_info) = self.scene_viewer.get_animation_info(&anim_name) {
-                                if let Some(metadata) = &anim_info.metadata {
-                                    for (key, value) in metadata {
-                                        ui.small(format!("{}: {:?}", key, value));
-                                    }
-                                }
-                            }
-                        });
-                    });
-                    ui.separator();
-                }
-            });
-        }
-        
-        // Show animation channels if available
-        if let Some(animation_data) = &self.scene_viewer.animation_data {
-            if !animation_data.channels.is_empty() {
-                ui.separator();
-                ui.label("Animation Channels:");
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for channel in &animation_data.channels {
-                        ui.horizontal(|ui| {
-                            ui.label(&channel.name);
-                            if let Some(priority) = channel.priority_order {
-                                ui.label(format!("Priority: {:.1}", priority));
-                            }
-                            if let Some(index) = channel.channel_index {
-                                ui.label(format!("Index: {}", index));
-                            }
-                        });
                     }
-                });
+                } else {
+                    ui.label("No corresponding .bent file found for this scene.");
+                    ui.label(format!("Expected file: {}", selected_file.with_extension("bent").display()));
+                }
             }
         }
-    } else {
-        ui.label("No animation data available.");
-        ui.label("Animation data is loaded from .bent files with the same name as the .oct file.");
-    }
+
+        if self.scene_viewer.has_animation_data() {
+            ui.label("Available Animations:");
+            
+            let animation_names = self.scene_viewer.get_animation_names();
+            if animation_names.is_empty() {
+                ui.label("No animations found in this .bent file.");
+            } else {
+                // Collect animation info first to avoid borrowing issues
+                let animations: Vec<(String, String)> = animation_names
+                    .iter()
+                    .filter_map(|name| {
+                        self.scene_viewer.get_animation_info(name)
+                            .map(|info| (name.clone(), info.filename.clone()))
+                    })
+                    .collect();
+                
+                // Use a consistent ID for the scroll area
+                egui::ScrollArea::vertical()
+                    .id_source("animations_scroll_area") // Add consistent ID
+                    .show(ui, |ui| {
+                        for (anim_name, filename) in animations {
+                            // Use animation name as ID for consistent widget IDs
+                            ui.push_id(&anim_name, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("▶").clicked() {
+                                        // Try to load the animation .oct file
+                                        self.load_animation_file(&filename, ctx);
+                                    }
+                                    
+                                    ui.vertical(|ui| {
+                                        ui.label(&anim_name);
+                                        ui.small(&filename);
+                                        
+                                        // Show metadata if available (we need to get this separately)
+                                        if let Some(anim_info) = self.scene_viewer.get_animation_info(&anim_name) {
+                                            if let Some(metadata) = &anim_info.metadata {
+                                                for (key, value) in metadata {
+                                                    ui.small(format!("{}: {:?}", key, value));
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                            });
+                        }
+                    });
+            }
+            
+            // Show animation channels if available
+            if let Some(animation_data) = &self.scene_viewer.animation_data {
+                if !animation_data.channels.is_empty() {
+                    ui.separator();
+                    ui.label("Animation Channels:");
+                    
+                    // Use consistent ID for channels scroll area
+                    egui::ScrollArea::vertical()
+                        .id_source("channels_scroll_area")
+                        .show(ui, |ui| {
+                            for channel in &animation_data.channels {
+                                ui.push_id(&channel.name, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(&channel.name);
+                                        if let Some(priority) = channel.priority_order {
+                                            ui.label(format!("Priority: {:.1}", priority));
+                                        }
+                                        if let Some(index) = channel.channel_index {
+                                            ui.label(format!("Index: {}", index));
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                }
+            }
+        } else {
+            ui.label("No animation data available.");
+            ui.label("Animation data is loaded from .bent files with the same name as the .oct file.");
+        }
+    });
 }
 
 fn load_animation_file(&mut self, filename: &str, ctx: &egui::Context) {
